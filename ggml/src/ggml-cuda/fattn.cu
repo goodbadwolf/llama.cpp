@@ -132,6 +132,20 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
+    // QSA_SPARSE_MODE: unset or 2 keeps upstream behaviour, 1 restricts the sparse path
+    // to batches wide enough to be prefill, 0 disables it. A/B lever, and the 0 setting
+    // is the same-source dense control.
+    static const int sparse_mode = [] {
+        const char * e = getenv("QSA_SPARSE_MODE");
+        return e == nullptr ? 2 : atoi(e);
+    }();
+    if (sparse_mode == 0) {
+        return false;
+    }
+    if (sparse_mode == 1 && Q->ne[1] < 64) {
+        return false;
+    }
+
     const int64_t n_gather = (ncols1 == 1 ? Q->ne[1] : ncols1) * (int64_t) n_kv_max;
 
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
