@@ -11323,6 +11323,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
     }
+    // sparse decode with a q8_0 cache: only the gathered rows are converted to f16
+    for (int64_t kv : {32768, 65536}) {
+        for (int nb : {1, 5}) {
+            for (std::array<int32_t, 4> perm : {std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3}}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, perm, false, false, 2048));
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
