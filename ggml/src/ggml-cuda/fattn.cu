@@ -151,6 +151,136 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_mask_to_sparse_indices_ref(
+        const half * mask_ptr, int32_t * indices_ptr, int32_t * counts_ptr, const int ne30, const int n_queries,
+        const int ncols1, const int n_kv_max, const int64_t s31, const int64_t s33) {
+    ggml_cuda_pdl_sync();
+
+    constexpr int values_per_lane = 8;
+    const int tid      = threadIdx.x;
+    const int warp     = tid / WARP_SIZE;
+    const int lane     = tid % WARP_SIZE;
+    const int sequence = blockIdx.y;
+    const int group    = blockIdx.x;
+
+    const int q0 = group*ncols1;
+    const int q1 = min(q0 + ncols1, n_queries);
+
+    const half * mask = mask_ptr + sequence*s33 + q0*s31;
+    int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + group)*n_kv_max;
+
+    __shared__ int warp_offsets[256/WARP_SIZE];
+    __shared__ int row_count;
+    __shared__ int chunk_count;
+
+    if (tid == 0) {
+        row_count = 0;
+    }
+    __syncthreads();
+
+    for (int i0 = 0; i0 < ne30; i0 += blockDim.x*values_per_lane) {
+        uint32_t selected_warp[values_per_lane];
+        int warp_count = 0;
+#pragma unroll
+        for (int item = 0; item < values_per_lane; ++item) {
+            const int i = i0 + (warp*values_per_lane + item)*WARP_SIZE + lane;
+            bool selected = false;
+            for (int q = 0; q < q1 - q0 && !selected; ++q) {
+                selected = i < ne30 && isfinite(__half2float(mask[q*s31 + i]));
+            }
+            selected_warp[item] = __ballot_sync(0xFFFFFFFF, selected);
+            warp_count += __popc(selected_warp[item]);
+        }
+
+        if (lane == 0) {
+            warp_offsets[warp] = warp_count;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            int offset = 0;
+#pragma unroll
+            for (int iw = 0; iw < 256/WARP_SIZE; ++iw) {
+                const int count = warp_offsets[iw];
+                warp_offsets[iw] = offset;
+                offset += count;
+            }
+            chunk_count = offset;
+        }
+        __syncthreads();
+
+        const uint32_t lane_mask = lane == 0 ? 0 : (1u << lane) - 1;
+        int warp_item_offset = 0;
+#pragma unroll
+        for (int item = 0; item < values_per_lane; ++item) {
+            const int i = i0 + (warp*values_per_lane + item)*WARP_SIZE + lane;
+            const int dst = row_count + warp_offsets[warp] + warp_item_offset + __popc(selected_warp[item] & lane_mask);
+            if ((selected_warp[item] & (uint32_t(1) << lane)) && dst < n_kv_max) {
+                indices[dst] = i;
+            }
+            warp_item_offset += __popc(selected_warp[item]);
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            row_count += chunk_count;
+        }
+        __syncthreads();
+    }
+
+    const int count = min(row_count, n_kv_max);
+    for (int i = count + tid; i < n_kv_max; i += blockDim.x) {
+        indices[i] = -1;
+    }
+    if (tid == 0) {
+        counts_ptr[int64_t(sequence)*gridDim.x + group] = count;
+    }
+    __syncthreads();
+
+    // the dependent grid reads indices, signal once the row is complete
+    ggml_cuda_pdl_lc();
+}
+
+static __global__ void flash_attn_sparse_indices_compare(
+        const int32_t * indices, const int32_t * counts, const int32_t * ref_indices, const int32_t * ref_counts,
+        const int64_t n_lists, const int n_kv_max) {
+    const int64_t list = blockIdx.x;
+    if (threadIdx.x == 0 && counts[list] != ref_counts[list]) {
+        printf("sparse index verify: list %lld count %d != ref %d\n", (long long) list, counts[list], ref_counts[list]);
+        __trap();
+    }
+    for (int i = threadIdx.x; i < n_kv_max; i += blockDim.x) {
+        const int64_t j = list*n_kv_max + i;
+        if (indices[j] != ref_indices[j]) {
+            printf("sparse index verify: list %lld slot %d index %d != ref %d\n", (long long) list, i, indices[j], ref_indices[j]);
+            __trap();
+        }
+    }
+    GGML_UNUSED(n_lists);
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+void ggml_cuda_flash_attn_ext_compact_mask_verify(
+        const ggml_tensor * mask, const int32_t * indices, const int32_t * counts, int32_t * ref,
+        int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(mask, indices, counts, ref, n_queries, ncols1, n_kv_max, stream);
+#else
+    const int64_t s31 = mask->nb[1] / sizeof(half);
+    const int64_t s33 = mask->nb[3] / sizeof(half);
+    const int n_groups = (n_queries + ncols1 - 1)/ncols1;
+    const int64_t n_lists = int64_t(n_groups)*mask->ne[3];
+    int32_t * ref_counts = ref + n_lists*n_kv_max;
+    flash_attn_mask_to_sparse_indices_ref<<<dim3(n_groups, mask->ne[3], 1), 256, 0, stream>>>(
+        (const half *) mask->data, ref, ref_counts, int(mask->ne[0]), n_queries, ncols1, n_kv_max, s31, s33);
+    CUDA_CHECK(cudaGetLastError());
+    flash_attn_sparse_indices_compare<<<n_lists, 256, 0, stream>>>(indices, counts, ref, ref_counts, n_lists, n_kv_max);
+    CUDA_CHECK(cudaGetLastError());
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(cc, dst, ncols1);
