@@ -23,11 +23,11 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     const int tid      = threadIdx.x;
     const int warp     = tid / WARP_SIZE;
     const int lane     = tid % WARP_SIZE;
-    const int chunk    = blockIdx.x;
-    const int n_chunks = gridDim.x;
-    const int group    = blockIdx.y;
+    const int group    = blockIdx.x;
+    const int chunk    = blockIdx.y;
+    const int n_chunks = gridDim.y;
     const int sequence = blockIdx.z;
-    const int64_t list = int64_t(sequence)*gridDim.y + group;
+    const int64_t list = int64_t(sequence)*gridDim.x + group;
 
     const int q0 = group*ncols1;
     const int q1 = min(q0 + ncols1, n_queries);
@@ -142,7 +142,8 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const int64_t s31 = mask->nb[1] / sizeof(half);
     const int64_t s33 = mask->nb[3] / sizeof(half);
     const int n_chunks = (mask->ne[0] + FATTN_SPARSE_CHUNK - 1) / FATTN_SPARSE_CHUNK;
-    const dim3 blocks_num(n_chunks, (n_queries + ncols1 - 1)/ncols1, mask->ne[3]);
+    // query groups on x: a single-query batch can have more of them than the 65535 blocks y allows
+    const dim3 blocks_num((n_queries + ncols1 - 1)/ncols1, n_chunks, mask->ne[3]);
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     // the last group of queries is partial only if ncols1 does not divide n_queries
