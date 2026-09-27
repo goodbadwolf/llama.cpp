@@ -54,7 +54,8 @@ struct cache_buffer_collector : llama_io_write_i {
 
 static llama_context * init_ctx(llama_model * model, llama_context_params cparams, uint8_t fill) {
     llama_context * ctx = llama_init_from_model(model, cparams);
-    if (ctx == nullptr || fill == 0) {
+    // without rollback there are no snapshot planes to poison
+    if (ctx == nullptr || fill == 0 || llama_n_rs_seq(ctx) == 0) {
         return ctx;
     }
 
@@ -659,16 +660,18 @@ struct ctx_spec {
     uint32_t n_seq_max;
     uint32_t n_rs_seq;
     uint32_t n_ubatch;
+    llama_attention_type attention_type = LLAMA_ATTENTION_TYPE_UNSPECIFIED;
 };
 
 static llama_context * make_ctx_multi(const common_params & params, llama_model * model, uint8_t fill, const ctx_spec & spec) {
     auto cparams = common_context_params_to_llama(params);
-    cparams.n_seq_max  = spec.n_seq_max;
-    cparams.n_rs_seq   = spec.n_rs_seq;
-    cparams.n_ctx      = 1024;
-    cparams.n_batch    = 512;
-    cparams.n_ubatch   = spec.n_ubatch;
-    cparams.kv_unified = true;
+    cparams.n_seq_max      = spec.n_seq_max;
+    cparams.n_rs_seq       = spec.n_rs_seq;
+    cparams.n_ctx          = 1024;
+    cparams.n_batch        = 512;
+    cparams.n_ubatch       = spec.n_ubatch;
+    cparams.kv_unified     = true;
+    cparams.attention_type = spec.attention_type;
     return init_ctx(model, cparams, fill);
 }
 
@@ -878,6 +881,11 @@ static bool test_failed_ubatch(const common_params & params, llama_model * model
             return false;
         }
         auto * mem = llama_get_memory(ctx);
+        if (c.pending && llama_n_rs_seq(ctx) == 0) {
+            fprintf(stderr, "%s : %s: skipped, rollback is disabled for this context\n", __func__, c.name);
+            llama_free(ctx);
+            continue;
+        }
         abort_ctl ctl;
         llama_set_abort_callback(ctx, abort_cb, &ctl);
 
@@ -1307,6 +1315,48 @@ static bool test_refusal(const common_params & params, llama_model * model, int 
     return all_ok;
 }
 
+// Under non-causal attention every token's state has seen the tokens after it, so the snapshot planes are not the
+// history a rollback needs. A context that is non-causal, by the model's metadata or by attention_type, must get no
+// rollback depth at all: n_rs_seq clamps to 0 and partial removals are refused.
+static bool test_non_causal(const common_params & params, llama_model * model, int n_vocab, uint8_t fill) {
+    constexpr llama_pos P = 12;
+
+    char arch[64] = {0};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    const std::string key = std::string(arch) + ".attention.causal";
+    char val[16] = {0};
+    const bool model_causal = llama_model_meta_val_str(model, key.c_str(), val, sizeof(val)) < 0 || strcmp(val, "false") != 0;
+
+    bool all_ok = true;
+    for (const bool non_causal_type : { false, true }) {
+        const ctx_spec spec = { 1, 8, 64, non_causal_type ? LLAMA_ATTENTION_TYPE_NON_CAUSAL : LLAMA_ATTENTION_TYPE_UNSPECIFIED };
+        llama_context * ctx = make_ctx_multi(params, model, fill, spec);
+        if (ctx == nullptr) {
+            fprintf(stderr, "%s : failed to init context\n", __func__);
+            return false;
+        }
+        const bool expect_rollback = model_causal && !non_causal_type;
+        const char * what = non_causal_type ? "attention_type non-causal" : (model_causal ? "control: causal model" : "non-causal model");
+
+        bool ok = decode_specs(ctx, tok_run(n_vocab, 0, 0, P)) == 0;
+        ok = ok && decode_specs(ctx, tok_cat(tok_run(n_vocab, 0, P, 2), tok_run(n_vocab, 0, P + 2, 2, 1))) == 0;
+        if (!ok) {
+            fprintf(stderr, "%s : %s: setup failed\n", __func__, what);
+            llama_free(ctx);
+            return false;
+        }
+        const uint32_t n_rs_seq = llama_n_rs_seq(ctx);
+        const bool accepted = llama_memory_seq_rm(llama_get_memory(ctx), 0, P + 2, -1);
+        llama_free(ctx);
+
+        const bool pass = expect_rollback ? (n_rs_seq == 8 && accepted) : (n_rs_seq == 0 && !accepted);
+        fprintf(stderr, "%s : %s: n_rs_seq %u, anchored removal %s%s\n", __func__, what, n_rs_seq, accepted ? "accepted" : "refused",
+                pass ? "" : (expect_rollback ? " (expected rollback)" : " (expected no rollback: snapshots written non-causally are not history)"));
+        all_ok = all_ok && pass;
+    }
+    return all_ok;
+}
+
 static bool model_is_deepseek4(llama_model * model) {
     char arch[64] = {0};
     llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
@@ -1335,6 +1385,9 @@ static int test_lifecycle(const common_params & params, llama_model * model, uin
         ret = 1;
     }
     if (!test_refusal(params, model, n_vocab, fill)) {
+        ret = 1;
+    }
+    if (!test_non_causal(params, model, n_vocab, fill)) {
         ret = 1;
     }
     return ret;

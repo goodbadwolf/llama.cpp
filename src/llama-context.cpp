@@ -227,6 +227,13 @@ llama_context::llama_context(
         cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
     }
 
+    // recurrent snapshots written under non-causal attention have seen the tokens after them, so they cannot
+    // serve a rollback
+    if (cparams.n_rs_seq > 0 && !cparams.causal_attn) {
+        LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but attention is not causal; clamping to 0\n", __func__, cparams.n_rs_seq);
+        cparams.n_rs_seq = 0;
+    }
+
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
