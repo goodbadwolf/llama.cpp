@@ -922,6 +922,142 @@ static bool test_failed_ubatch(const common_params & params, llama_model * model
     return all_ok;
 }
 
+// One llama_decode at the server's shape: a verify ubatch for one sequence (accepted tokens, then rejected drafts)
+// and a one-token ubatch for the others, whose find_slot may relocate the verified sequence. The verify trim then
+// has to read the relocated sequence's own snapshot. A context whose cells do not follow seq ids runs the same
+// batches as a reference with ordered cells, so every state must match exactly, before and after the trim is used.
+struct reloc_round {
+    llama_seq_id              verify;
+    std::vector<llama_seq_id> others;
+    int                       accepted;
+    std::vector<llama_seq_id> others2 = {}; // a second one-token ubatch after the trim, so the trimmed sequence
+                                            // is relocated or gathered while its rollback is pending
+};
+
+static bool run_relocation_rounds(const common_params & params, llama_model * model, int n_vocab, uint8_t fill,
+                                  const char * name, uint32_t n_seq_max, const std::vector<llama_seq_id> & order,
+                                  const std::vector<reloc_round> & rounds) {
+    constexpr llama_pos P = 12;
+    constexpr uint32_t  K = 3; // the server's draft n_max
+
+    llama_context * roll = make_ctx_multi(params, model, fill, { n_seq_max, K, 512 });
+    llama_context * ref  = make_ctx_multi(params, model, fill, { n_seq_max, K, 512 });
+    if (roll == nullptr || ref == nullptr) {
+        fprintf(stderr, "%s : failed to init contexts\n", __func__);
+        return false;
+    }
+    if (llama_n_rs_seq(roll) < K) {
+        fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+        llama_free(roll);
+        llama_free(ref);
+        return true;
+    }
+
+    bool ok = true;
+    for (const llama_seq_id s : order) {
+        ok = ok && decode_specs(roll, tok_run(n_vocab, s, 0, P)) == 0;
+    }
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        ok = ok && decode_specs(ref, tok_run(n_vocab, (llama_seq_id) s, 0, P)) == 0;
+    }
+
+    const auto compare_all = [&](const char * when, int round) {
+        bool same = true;
+        for (uint32_t s = 0; s < n_seq_max; ++s) {
+            const std::string diff = state_diff(seq_state(roll, (llama_seq_id) s), seq_state(ref, (llama_seq_id) s));
+            if (!diff.empty()) {
+                fprintf(stderr, "%s : %s round %d: seq %u %s DIFFERS from the reference %s\n", __func__, name, round, s, when, diff.c_str());
+                same = false;
+            }
+        }
+        return same;
+    };
+
+    bool all_ok = true;
+    std::vector<llama_pos> pos(n_seq_max, P);
+    for (size_t i = 0; i < rounds.size() && ok; ++i) {
+        const auto & r = rounds[i];
+        const llama_pos  p = pos[r.verify];
+        const int rollback = (int) K + 1 - r.accepted;
+
+        std::vector<tokspec> batch = tok_cat(tok_run(n_vocab, r.verify, p, r.accepted),
+                                             tok_run(n_vocab, r.verify, p + r.accepted, rollback, 1));
+        for (const llama_seq_id o : r.others) {
+            batch = tok_cat(batch, tok_run(n_vocab, o, pos[o], 1));
+            pos[o] += 1;
+        }
+        ok = ok && decode_specs(roll, batch) == 0 && decode_specs(ref, batch) == 0;
+        ok = ok && llama_memory_seq_rm(llama_get_memory(roll), r.verify, p + r.accepted, -1);
+        ok = ok && llama_memory_seq_rm(llama_get_memory(ref),  r.verify, p + r.accepted, -1);
+        pos[r.verify] = p + r.accepted;
+        if (!r.others2.empty()) {
+            std::vector<tokspec> again;
+            for (const llama_seq_id o : r.others2) {
+                again = tok_cat(again, tok_run(n_vocab, o, pos[o], 1));
+                pos[o] += 1;
+            }
+            ok = ok && decode_specs(roll, again) == 0 && decode_specs(ref, again) == 0;
+        }
+        if (!ok) {
+            break;
+        }
+        bool same = compare_all("after the trim", (int) i);
+
+        // use the trimmed state
+        const std::vector<tokspec> next = { { r.verify, pos[r.verify], tok_at(n_vocab, r.verify, pos[r.verify]) } };
+        ok = ok && decode_specs(roll, next) == 0 && decode_specs(ref, next) == 0;
+        pos[r.verify] += 1;
+        if (!ok) {
+            break;
+        }
+        same = compare_all("after continuing", (int) i) && same;
+
+        fprintf(stderr, "%s : %s round %d: trim of %d after relocation %s the reference\n", __func__, name, (int) i, rollback,
+                same ? "matches" : "DIFFERS from");
+        all_ok = all_ok && same;
+    }
+    if (!ok) {
+        fprintf(stderr, "%s : %s: setup failed\n", __func__, name);
+        all_ok = false;
+    }
+
+    fprintf(stderr, "%s : %s: graphs reused %d times (reference %d)\n", __func__, name,
+            llama_perf_context(roll).n_reused, llama_perf_context(ref).n_reused);
+
+    llama_free(roll);
+    llama_free(ref);
+    return all_ok;
+}
+
+static bool test_relocation(const common_params & params, llama_model * model, int n_vocab, uint8_t fill) {
+    bool all_ok = true;
+
+    // cells seq1, seq0, seq2: the {seq1, seq2} ubatch gathers seq2 into seq0's cell and pushes seq0 out
+    all_ok = run_relocation_rounds(params, model, n_vocab, fill, "server shape 4/1/1, accepted 1", 3, { 1, 0, 2 }, { { 0, { 1, 2 }, 1 } }) && all_ok;
+    all_ok = run_relocation_rounds(params, model, n_vocab, fill, "server shape 4/1/1, accepted 2", 3, { 1, 0, 2 }, { { 0, { 1, 2 }, 2 } }) && all_ok;
+
+    // cells seq1, seq2, seq0: gathering seq0 then seq1 moves seq2 into seq0's old cell, a three-cell cycle
+    all_ok = run_relocation_rounds(params, model, n_vocab, fill, "three-cell cycle", 3, { 1, 2, 0 }, { { 2, { 0, 1 }, 1 } }) && all_ok;
+
+    // Each round: a verify ubatch (no carry), a pair ubatch that relocates the verified sequence (carry), the trim,
+    // the same pair again (same sequences, nothing left to relocate: a graph reused here would still hold the carry
+    // and must be rejected), then a one-token ubatch that uses the trimmed state. A graph can only be reused by a
+    // consecutive ubatch of the same sequences, and after a gather those sit contiguously, so a reused graph never
+    // has a different carry list; the size check guards the transitions in both directions.
+    all_ok = run_relocation_rounds(params, model, n_vocab, fill, "repeated relocations", 3, { 1, 0, 2 },
+            { { 0, { 2, 1 }, 1, { 2, 1 } }, { 1, { 0, 2 }, 2, { 0, 2 } }, { 2, { 1, 0 }, 1, { 1, 0 } },
+              { 0, { 2, 1 }, 2, { 2, 1 } }, { 1, { 0, 2 }, 1, { 0, 2 } }, { 2, { 1, 0 }, 2, { 1, 0 } } }) && all_ok;
+
+    // cells seq1, seq0, seq2, seq3: three members gather and the verified sequence is displaced twice, two cells along
+    all_ok = run_relocation_rounds(params, model, n_vocab, fill, "three members, displaced twice", 4, { 1, 0, 2, 3 },
+            { { 0, { 1, 2, 3 }, 1, { 1, 2, 0 } }, { 2, { 1, 0, 3 }, 2, { 1, 0, 2 } } }) && all_ok;
+
+    // control: ordered cells, nothing is relocated
+    all_ok = run_relocation_rounds(params, model, n_vocab, fill, "control: ordered cells", 3, { 0, 1, 2 }, { { 0, { 1, 2 }, 1 } }) && all_ok;
+
+    return all_ok;
+}
+
 static bool model_is_deepseek4(llama_model * model) {
     char arch[64] = {0};
     llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
@@ -944,6 +1080,9 @@ static int test_lifecycle(const common_params & params, llama_model * model, uin
         ret = 1;
     }
     if (!test_failed_ubatch(params, model, n_vocab, fill)) {
+        ret = 1;
+    }
+    if (!test_relocation(params, model, n_vocab, fill)) {
         ret = 1;
     }
     return ret;

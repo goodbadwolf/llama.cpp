@@ -276,6 +276,10 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // snapshot planes to carry for relocated states, absent when nothing is relocated
+    ggml_tensor * s_carry_src = nullptr; // I32 [n_carry]
+    ggml_tensor * s_carry_dst = nullptr; // I64 [n_carry]
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
@@ -1329,6 +1333,8 @@ struct llm_graph_context {
             ggml_tensor * s,
             ggml_tensor * state_copy_main,
             ggml_tensor * state_copy_extra,
+            ggml_tensor * state_carry_src,
+            ggml_tensor * state_carry_dst,
                 int32_t   state_size,
                 int32_t   n_seqs,
                uint32_t   n_rs,
