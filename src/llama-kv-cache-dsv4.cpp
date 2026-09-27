@@ -7,6 +7,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <limits>
 #include <cassert>
 #include <climits>
 #include <cstdlib>
@@ -920,7 +921,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*hparams.n_layer()*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream*(1 + n_rs_seq))*hparams.n_layer()*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -971,7 +972,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         std::vector<ggml_tensor *> kv_stream;
         std::vector<ggml_tensor *> score_stream;
 
-        for (uint32_t s = 0; s < n_stream; ++s) {
+        for (uint32_t s = 0; s < n_planes; ++s) {
             kv_stream.push_back(ggml_view_2d(ctx, kv, n_embd_state, state_size, kv->nb[1], s*kv->nb[2]));
             score_stream.push_back(ggml_view_2d(ctx, score, n_embd_state, state_size, score->nb[1], s*score->nb[2]));
         }
@@ -1022,17 +1023,17 @@ void llama_dsv4_comp_state::clear(llama_seq_id seq_id, bool data) {
     }
 }
 
-void llama_dsv4_comp_state::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
-    GGML_ASSERT(seq_id_src >= 0 && (uint32_t) seq_id_src < n_stream);
+void llama_dsv4_comp_state::seq_cp(uint32_t stream_src, llama_seq_id seq_id_dst) {
+    GGML_ASSERT(stream_src < n_stream*(1 + n_rs_seq));
     GGML_ASSERT(seq_id_dst >= 0 && (uint32_t) seq_id_dst < n_stream);
 
-    if (seq_id_src == seq_id_dst) {
+    if (stream_src == (uint32_t) seq_id_dst) {
         return;
     }
 
     clear(seq_id_dst, true);
 
-    sc_info.ssrc.push_back((uint32_t) seq_id_src);
+    sc_info.ssrc.push_back(stream_src);
     sc_info.sdst.push_back((uint32_t) seq_id_dst);
 }
 
@@ -1228,7 +1229,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid(model.hparams),
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
-    rs_idx(n_seq_max, 0) {
+    rs_idx(n_seq_max, 0),
+    rs_depth(n_seq_max, 0) {
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
         if (filter && !filter(il)) {
@@ -1456,6 +1458,14 @@ void llama_kv_cache_dsv4::clear(bool data) {
     clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows
 }
 
+void llama_kv_cache_dsv4::set_rollback_enabled(bool enabled) {
+    rollback_enabled = enabled;
+
+    if (!enabled) {
+        std::fill(rs_depth.begin(), rs_depth.end(), 0);
+    }
+}
+
 bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (p1 >= 0) {
         return false;
@@ -1482,8 +1492,9 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return false;
         }
 
+        // the snapshot planes serve the removal only up to what the last ubatch wrote as this sequence's history
         const llama_pos rollback = pos_max - (p0 - 1);
-        if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
+        if (rollback < 1 || rollback > (llama_pos) rs_depth[seq_id]) {
             return false;
         }
 
@@ -1495,6 +1506,7 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         const bool res = kv_raw->seq_rm(seq_id, p0, p1);
         if (res) {
             rs_idx[seq_id] = (uint32_t) rollback;
+            rs_depth[seq_id] = 0;
         }
 
         return res;
@@ -1517,12 +1529,18 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     kv_hca->seq_cp(seq_id_src, seq_id_dst, -1, -1);
     kv_lid->seq_cp(seq_id_src, seq_id_dst, -1, -1);
 
-    csa_state->seq_cp(seq_id_src, seq_id_dst);
-    hca_state->seq_cp(seq_id_src, seq_id_dst);
-    lid_state->seq_cp(seq_id_src, seq_id_dst);
+    // the copy continues from the source's logical state, which a pending rollback puts in another plane
+    GGML_ASSERT(seq_id_src >= 0 && (uint32_t) seq_id_src < n_seq_max);
+    const uint32_t plane_src = n_rs_seq > 0 ? rs_idx[seq_id_src] : 0;
+
+    csa_state->seq_cp(plane_src*csa_state->get_n_stream() + seq_id_src, seq_id_dst);
+    hca_state->seq_cp(plane_src*hca_state->get_n_stream() + seq_id_src, seq_id_dst);
+    lid_state->seq_cp(plane_src*lid_state->get_n_stream() + seq_id_src, seq_id_dst);
 
     if (seq_id_src != seq_id_dst) {
-        rs_idx[seq_id_dst] = 0;
+        // only the current plane is copied
+        rs_idx[seq_id_dst]   = 0;
+        rs_depth[seq_id_dst] = 0;
     }
 }
 
@@ -1543,10 +1561,19 @@ void llama_kv_cache_dsv4::seq_keep(llama_seq_id seq_id) {
 
 void llama_kv_cache_dsv4::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     kv_raw->seq_add(seq_id, p0, p1, shift);
+
+    // the planes no longer sit one position apart from the new positions
+    if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max) {
+        rs_depth[seq_id] = 0;
+    }
 }
 
 void llama_kv_cache_dsv4::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     kv_raw->seq_div(seq_id, p0, p1, d);
+
+    if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max) {
+        rs_depth[seq_id] = 0;
+    }
 }
 
 llama_pos llama_kv_cache_dsv4::seq_pos_min(llama_seq_id seq_id) const {
@@ -1664,11 +1691,14 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     hca_state->state_read(io, seq_id, flags);
     lid_state->state_read(io, seq_id, flags);
 
+    // only the current plane is restored
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
-        rs_idx[seq_id] = 0;
+        rs_idx[seq_id]   = 0;
+        rs_depth[seq_id] = 0;
     } else {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        std::fill(rs_depth.begin(), rs_depth.end(), 0);
     }
 }
 
@@ -1706,6 +1736,88 @@ uint32_t llama_kv_cache_dsv4::get_n_rs_seq() const {
 
 const std::vector<uint32_t> & llama_kv_cache_dsv4::get_rs_idx() const {
     return rs_idx;
+}
+
+const std::vector<uint32_t> & llama_kv_cache_dsv4::get_rs_depth() const {
+    return rs_depth;
+}
+
+void llama_kv_cache_dsv4::set_rs_depth(const std::vector<uint32_t> & depth) {
+    GGML_ASSERT(depth.size() == rs_depth.size());
+    rs_depth = depth;
+}
+
+void llama_kv_cache_dsv4::grant_rs_depth(const llama_ubatch & ubatch) {
+    if (n_rs_seq == 0) {
+        return;
+    }
+
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+            continue;
+        }
+
+        // plane d is the state after all but the last d tokens of this ubatch, and seq_rm maps a position
+        // difference to a plane, so the history is usable only for consecutive positions
+        uint32_t  n_seq_tokens = 0;
+        llama_pos pos_prev     = -1;
+        bool      consecutive  = true;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (!dsv4_token_has_seq(ubatch, i, seq_id)) {
+                continue;
+            }
+            consecutive = consecutive && (n_seq_tokens == 0 || ubatch.pos[i] == pos_prev + 1);
+            pos_prev = ubatch.pos[i];
+            ++n_seq_tokens;
+        }
+
+        rs_depth[seq_id] = consecutive && rollback_enabled ? std::min(n_seq_tokens, n_rs_seq) : 0;
+    }
+}
+
+void llama_kv_cache_dsv4::revert_ubatch(const std::vector<llama_ubatch> & ubatches, size_t i_ubatch, bool graph_ran,
+                                        const std::vector<uint32_t> & rs_idx_prev) {
+    const llama_ubatch & ubatch = ubatches[i_ubatch];
+
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+            continue;
+        }
+
+        if (graph_ran) {
+            // the compressor state is updated in place, so whatever the graph wrote before failing is unknown
+            LLAMA_LOG_WARN("%s: removing seq_id = %d, the failed ubatch may have overwritten its state\n", __func__, seq_id);
+            seq_rm(seq_id, -1, -1);
+            continue;
+        }
+
+        // nothing was computed: drop the positions the raw cache took and give back the rollback restore that the
+        // first ubatch of this batch touching the sequence consumed when the plans were built
+        llama_pos p0 = std::numeric_limits<llama_pos>::max();
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (dsv4_token_has_seq(ubatch, i, seq_id)) {
+                p0 = std::min(p0, ubatch.pos[i]);
+            }
+        }
+        if (p0 != std::numeric_limits<llama_pos>::max()) {
+            kv_raw->seq_rm(seq_id, p0, -1);
+            kv_csa->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
+            kv_hca->seq_rm(seq_id, p0/DSV4_HCA_RATIO, -1);
+            kv_lid->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
+        }
+
+        bool consumed_earlier = false;
+        for (size_t j = 0; j < i_ubatch; ++j) {
+            for (uint32_t t = 0; t < ubatches[j].n_seqs_unq; ++t) {
+                consumed_earlier = consumed_earlier || ubatches[j].seq_id_unq[t] == seq_id;
+            }
+        }
+        if (!consumed_earlier && (size_t) seq_id < rs_idx_prev.size()) {
+            rs_idx[seq_id] = rs_idx_prev[seq_id];
+        }
+    }
 }
 
 void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches) {
@@ -1754,9 +1866,11 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
     lid_state->clear(seq_id, data);
 
     if (seq_id >= 0) {
-        rs_idx[seq_id] = 0;
+        rs_idx[seq_id]   = 0;
+        rs_depth[seq_id] = 0;
     } else {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        std::fill(rs_depth.begin(), rs_depth.end(), 0);
     }
 }
 
@@ -2047,7 +2161,9 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         slot_info_vec_t sinfos_raw_swa_read,
         std::vector<llama_ubatch> ubatches,
         std::vector<llama_ubatch> ubatches_raw) :
+    kv(kv),
     ubatches(std::move(ubatches)),
+    rs_idx_prev(kv->get_rs_idx()),
     plans_csa(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
@@ -2120,9 +2236,24 @@ bool llama_kv_cache_dsv4_context::apply() {
         csa_state->apply_copies(sc_info_csa);
         hca_state->apply_copies(sc_info_hca);
         lid_state->apply_copies(sc_info_lid);
+    } else if (kv != nullptr) {
+        rs_depth_prev = kv->get_rs_depth();
+        kv->grant_rs_depth(ubatches[i_next]);
     }
 
     return res;
+}
+
+void llama_kv_cache_dsv4_context::revert(bool graph_ran) {
+    if (ubatches.empty() || kv == nullptr) {
+        return;
+    }
+
+    if (!graph_ran) {
+        kv->set_rs_depth(rs_depth_prev);
+    }
+
+    kv->revert_ubatch(ubatches, i_next, graph_ran, rs_idx_prev);
 }
 
 llama_memory_status llama_kv_cache_dsv4_context::get_status() const {

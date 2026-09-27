@@ -675,6 +675,12 @@ static llama_context * make_ctx_multi(const common_params & params, llama_model 
     return init_ctx(model, cparams, fill);
 }
 
+static bool model_is_deepseek4(llama_model * model) {
+    char arch[64] = {0};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    return strcmp(arch, "deepseek4") == 0;
+}
+
 // the exported state must tell two histories apart, otherwise every bitwise comparison below is vacuous
 static bool test_state_instrument(const common_params & params, llama_model * model, int n_vocab, uint8_t fill) {
     const ctx_spec spec = { 1, 8, 64 };
@@ -746,13 +752,17 @@ static bool test_pending_index_lifecycle(const common_params & params, llama_mod
             switch (op) {
                 case OP_SEQ_KEEP:
                 case OP_FINITE_RM:
+                    // the reference sees the same removal, which for DeepSeek V4 also zeroes the stream's rows
                     if (op == OP_SEQ_KEEP) {
                         llama_memory_seq_keep(mem, 0);
+                        llama_memory_seq_keep(llama_get_memory(ref), 0);
                     } else if (!llama_memory_seq_rm(mem, 1, 0, 100000)) {
                         fprintf(stderr, "%s : %s%s: skipped, this memory refuses a finite removal\n", __func__, pending ? "" : "control ", name);
                         llama_free(roll);
                         llama_free(ref);
                         continue;
+                    } else {
+                        llama_memory_seq_rm(llama_get_memory(ref), 1, 0, 100000);
                     }
                     // a new conversation starts on seq 1 from the zero state
                     next_roll = { { 1, 0, tok_at(n_vocab, 1, 0, 3) } };
@@ -973,8 +983,9 @@ static bool run_relocation_rounds(const common_params & params, llama_model * mo
     constexpr llama_pos P = 12;
     constexpr uint32_t  K = 3; // the server's draft n_max
 
-    llama_context * roll = make_ctx_multi(params, model, fill, { n_seq_max, K, 512 });
-    llama_context * ref  = make_ctx_multi(params, model, fill, { n_seq_max, K, 512 });
+    const ctx_spec spec = { n_seq_max, K, 512 };
+    llama_context * roll = make_ctx_multi(params, model, fill, spec);
+    llama_context * ref  = make_ctx_multi(params, model, fill, spec);
     if (roll == nullptr || ref == nullptr) {
         fprintf(stderr, "%s : failed to init contexts\n", __func__);
         return false;
@@ -1128,10 +1139,12 @@ static bool test_refusal(const common_params & params, llama_model * model, int 
         int              rollback;
         bool             expect_accept;
     };
+    // DeepSeek V4 also snapshots the state the ubatch started from, so it serves a removal of the whole ubatch
+    const bool whole_ubatch_ok = model_is_deepseek4(model);
     const step_case step_cases[] = {
-        { "whole ubatch of 1 by 1",                     { 1 },       1, false },
-        { "whole ubatch of 3 by 3",                     { 3 },       3, false },
-        { "whole ubatch of 8 by 8",                     { 8 },       8, false },
+        { "whole ubatch of 1 by 1",                     { 1 },       1, whole_ubatch_ok },
+        { "whole ubatch of 3 by 3",                     { 3 },       3, whole_ubatch_ok },
+        { "whole ubatch of 8 by 8",                     { 8 },       8, whole_ubatch_ok },
         { "past the last ubatch, steps (3,2) by 4",     { 3, 2 },    4, false },
         { "past the last ubatch, steps (1,1,1) by 2",   { 1, 1, 1 }, 2, false },
         { "anchor in an earlier ubatch, steps (4,1) by 3", { 4, 1 }, 3, false },
@@ -1357,20 +1370,9 @@ static bool test_non_causal(const common_params & params, llama_model * model, i
     return all_ok;
 }
 
-static bool model_is_deepseek4(llama_model * model) {
-    char arch[64] = {0};
-    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
-    return strcmp(arch, "deepseek4") == 0;
-}
-
 static int test_lifecycle(const common_params & params, llama_model * model, uint8_t fill) {
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
-    if (model_is_deepseek4(model)) {
-        // DeepSeek V4 keeps its rollback state in llama_kv_cache_dsv4, which does not implement these rules yet
-        fprintf(stderr, "%s : skipping for DeepSeek V4\n", __func__);
-        return 0;
-    }
     if (!test_state_instrument(params, model, n_vocab, fill)) {
         return 1;
     }
