@@ -59,6 +59,11 @@ struct llama_memory_context_i {
     // return false on failure
     virtual bool apply() = 0;
 
+    // undo what apply() did for the current ubatch after the ubatch failed
+    // when graph_ran is true the graph may have written to the memory, so state that could have been
+    // overwritten is removed instead of restored
+    virtual void revert(bool graph_ran) { GGML_UNUSED(graph_ran); }
+
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;
 
