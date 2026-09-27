@@ -733,6 +733,30 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     used = std::count_if(cells.begin(), cells.end(),
         [](const mem_cell & cell){ return !cell.is_empty(); });
 
+    // The graph copies only plane 0 of a non-member cell whose data was moved by the gather above. Its snapshot
+    // planes have to move with it, or a later rollback of that sequence reads the previous occupant's history.
+    // A pending rollback is applied by that copy and shifts the plane numbering, so nothing is carried for it.
+    carry_src.clear();
+    carry_dst.clear();
+    for (uint32_t i = n_seqs; i < n; ++i) {
+        const int32_t c = head + i;
+        const auto & cell = cells[c];
+        if (cell.is_empty() || cell.src0 == c) {
+            continue;
+        }
+        bool pending = false;
+        for (const llama_seq_id seq_id : cell.seq_id) {
+            pending = pending || rs_idx[seq_id] != 0;
+        }
+        if (pending) {
+            continue;
+        }
+        for (uint32_t j = 1; j <= n_rs_seq; ++j) {
+            carry_src.push_back((int32_t) (j*size) + cell.src0);
+            carry_dst.push_back((int64_t) (j*size) + c);
+        }
+    }
+
     // sanity check
     return n >= n_seqs;
 }
@@ -1431,6 +1455,19 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
+}
+
+uint32_t llama_memory_recurrent_context::get_n_carry() const {
+    // reserve for the worst case: every cell but one relocated
+    return is_full ? (mem->size - 1)*mem->n_rs_seq : (uint32_t) mem->carry_src.size();
+}
+
+int32_t llama_memory_recurrent_context::carry_src(int i) const {
+    return mem->carry_src[i];
+}
+
+int64_t llama_memory_recurrent_context::carry_dst(int i) const {
+    return mem->carry_dst[i];
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

@@ -88,6 +88,10 @@ public:
     // first zero-ed state
     int32_t rs_z = -1;
 
+    // rows of snapshot planes that move with a relocated non-member cell (see build_rs)
+    std::vector<int32_t> carry_src;
+    std::vector<int64_t> carry_dst;
+
     // TODO: optimize for recurrent state needs
     struct mem_cell {
         llama_pos pos  = -1;
@@ -195,6 +199,11 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // snapshot planes carried for relocated non-member cells, as (source row, destination row) pairs
+    uint32_t get_n_carry() const;
+    int32_t  carry_src(int i) const;
+    int64_t  carry_dst(int i) const;
 
 private:
     const llama_memory_status status;
