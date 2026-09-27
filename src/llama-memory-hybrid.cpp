@@ -273,6 +273,11 @@ bool llama_memory_hybrid_context::apply() {
     return res;
 }
 
+void llama_memory_hybrid_context::revert(bool graph_ran) {
+    ctx_attn->revert(graph_ran);
+    ctx_recr->revert(graph_ran);
+}
+
 llama_memory_status llama_memory_hybrid_context::get_status() const {
     return status;
 }

@@ -59,6 +59,10 @@ public:
     // find a contiguous slot of memory cells and emplace the ubatch there
     bool find_slot(const llama_ubatch & ubatch);
 
+    // undo the last find_slot() done through apply() after its ubatch failed
+    // when graph_ran is true, sequences whose cell data the graph may have overwritten are removed
+    void revert_slot(const llama_ubatch & ubatch, bool graph_ran);
+
     bool get_can_shift() const override;
 
     // state write/load
@@ -107,6 +111,15 @@ public:
     };
 
     std::vector<mem_cell> cells;
+
+    // metadata before the last find_slot() done through apply(), so that a failed ubatch can be undone
+    struct {
+        bool valid = false;
+        uint32_t head = 0;
+        uint32_t used = 0;
+        std::vector<mem_cell> cells;
+        std::vector<uint32_t> rs_idx;
+    } backup;
 
     // per layer
     std::vector<ggml_tensor *> r_l;
@@ -160,6 +173,7 @@ public:
 
     bool next()  override;
     bool apply() override;
+    void revert(bool graph_ran) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
