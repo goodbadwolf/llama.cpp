@@ -1910,7 +1910,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
                 LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
 
-                memory->seq_rm(s, pos_min[s], -1);
+                if (!memory->seq_rm(s, pos_min[s], -1)) {
+                    // the memory cannot drop only the failed positions, so drop the sequence rather than keep
+                    // entries the graph never computed
+                    LLAMA_LOG_WARN("%s: removing all memory module entries for seq_id = %d\n", __func__, s);
+                    memory->seq_rm(s, -1, -1);
+                }
             }
 
             switch (status) {
