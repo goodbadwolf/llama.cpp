@@ -1256,6 +1256,11 @@ void llama_context::set_causal_attn(bool value) {
 
     cparams.causal_attn = value;
 
+    // recurrent snapshots written under non-causal attention are not valid rollback history
+    if (memory) {
+        memory->set_rollback_enabled(value);
+    }
+
     sched_need_reserve = true;
 }
 

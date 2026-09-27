@@ -43,6 +43,8 @@ public:
 
     void clear(bool data) override;
 
+    void set_rollback_enabled(bool enabled) override;
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
@@ -82,6 +84,9 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // false while the attention is non-causal, see set_rollback_enabled()
+    bool rollback_enabled = true;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -98,6 +103,10 @@ public:
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;
+
+        // how many tokens the state can be rolled back with the cell's own snapshot planes:
+        //   plane j <= rs_depth is this cell's state j tokens ago, written by the last ubatch
+        uint32_t  rs_depth = 0;
 
         std::set<llama_seq_id> seq_id;
 
