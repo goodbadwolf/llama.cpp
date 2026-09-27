@@ -776,6 +776,113 @@ static bool test_pending_index_lifecycle(const common_params & params, llama_mod
     return all_ok;
 }
 
+struct abort_ctl {
+    int countdown = -1; // number of callback checks to let through before aborting, -1 for never
+};
+
+static bool abort_cb(void * data) {
+    auto * ctl = (abort_ctl *) data;
+    if (ctl->countdown < 0) {
+        return false;
+    }
+    if (ctl->countdown == 0) {
+        ctl->countdown = -1;
+        return true;
+    }
+    --ctl->countdown;
+    return false;
+}
+
+// After a decode fails part-way, a sequence must either be gone or stand exactly where it stood before the failed
+// ubatch, with the same state. Claiming positions the graph never computed is the failure this checks for.
+static bool check_after_failure(llama_context * ctx, llama_seq_id seq, llama_pos pos_before,
+                                const std::vector<rs_row> & state_before, const char * what) {
+    const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(ctx), seq);
+    if (pmax == -1) {
+        fprintf(stderr, "%s : %s: seq %d was dropped\n", __func__, what, seq);
+        return true;
+    }
+    if (pmax != pos_before) {
+        fprintf(stderr, "%s : %s: seq %d claims positions up to %d that were never computed\n", __func__, what, seq, pmax);
+        return false;
+    }
+    const std::string diff = state_diff(seq_state(ctx, seq), state_before);
+    if (!diff.empty()) {
+        fprintf(stderr, "%s : %s: seq %d kept its position but its state changed %s\n", __func__, what, seq, diff.c_str());
+        return false;
+    }
+    fprintf(stderr, "%s : %s: seq %d is intact\n", __func__, what, seq);
+    return true;
+}
+
+// A ubatch that fails after find_slot has claimed its positions. When the failed span is longer than the snapshot
+// depth, or there are no snapshots, the partial removal in the failure path cannot serve it.
+static bool test_failed_ubatch(const common_params & params, llama_model * model, int n_vocab, uint8_t fill) {
+    constexpr llama_pos P = 12;
+
+    struct variant {
+        const char * name;
+        uint32_t     n_rs_seq;
+        int          n_tokens;
+    };
+    const variant variants[] = {
+        { "abort of a 16-token ubatch with n_rs_seq 8", 8, 16 },
+        { "abort of a 4-token ubatch with n_rs_seq 0",  0,  4 },
+    };
+
+    bool all_ok = true;
+    for (const auto & v : variants) {
+        llama_context * ctx = make_ctx_multi(params, model, fill, { 1, v.n_rs_seq, 64 });
+        if (ctx == nullptr) {
+            fprintf(stderr, "%s : failed to init context\n", __func__);
+            return false;
+        }
+        abort_ctl ctl;
+        llama_set_abort_callback(ctx, abort_cb, &ctl);
+
+        bool ok = decode_specs(ctx, tok_run(n_vocab, 0, 0, P)) == 0;
+        const auto before = seq_state(ctx, 0);
+
+        ctl.countdown = 0;
+        const int rc = decode_specs(ctx, tok_run(n_vocab, 0, P, v.n_tokens, 1));
+        ctl.countdown = -1;
+        if (!ok) {
+            fprintf(stderr, "%s : %s: setup failed\n", __func__, v.name);
+            llama_free(ctx);
+            return false;
+        }
+        if (rc == 0) {
+            fprintf(stderr, "%s : %s: skipped, the abort callback was not honoured\n", __func__, v.name);
+            llama_free(ctx);
+            continue;
+        }
+        all_ok = check_after_failure(ctx, 0, P - 1, before, v.name) && all_ok;
+        llama_free(ctx);
+    }
+
+    // control: the same 16-token ubatch completes and leaves the same state as a reference
+    {
+        llama_context * roll = make_ctx_multi(params, model, fill, { 1, 8, 64 });
+        llama_context * ref  = make_ctx_multi(params, model, fill, { 1, 8, 64 });
+        if (roll == nullptr || ref == nullptr) {
+            fprintf(stderr, "%s : failed to init contexts\n", __func__);
+            return false;
+        }
+        abort_ctl ctl;
+        llama_set_abort_callback(roll, abort_cb, &ctl);
+        bool ok = decode_specs(roll, tok_run(n_vocab, 0, 0, P)) == 0 && decode_specs(ref, tok_run(n_vocab, 0, 0, P)) == 0;
+        ok = ok && decode_specs(roll, tok_run(n_vocab, 0, P, 16, 1)) == 0 && decode_specs(ref, tok_run(n_vocab, 0, P, 16, 1)) == 0;
+        const std::string diff = ok ? state_diff(seq_state(roll, 0), seq_state(ref, 0)) : "(decode failed)";
+        llama_free(roll);
+        llama_free(ref);
+        fprintf(stderr, "%s : control 16-token ubatch without abort: state %s the reference %s\n", __func__,
+                diff.empty() ? "matches" : "DIFFERS from", diff.c_str());
+        all_ok = all_ok && diff.empty();
+    }
+
+    return all_ok;
+}
+
 static bool model_is_deepseek4(llama_model * model) {
     char arch[64] = {0};
     llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
@@ -793,10 +900,14 @@ static int test_lifecycle(const common_params & params, llama_model * model, uin
     if (!test_state_instrument(params, model, n_vocab, fill)) {
         return 1;
     }
+    int ret = 0;
     if (!test_pending_index_lifecycle(params, model, n_vocab, fill)) {
-        return 1;
+        ret = 1;
     }
-    return 0;
+    if (!test_failed_ubatch(params, model, n_vocab, fill)) {
+        ret = 1;
+    }
+    return ret;
 }
 
 int main(int argc, char ** argv) {
