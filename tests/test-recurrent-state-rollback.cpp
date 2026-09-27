@@ -661,16 +661,19 @@ struct ctx_spec {
     uint32_t n_rs_seq;
     uint32_t n_ubatch;
     llama_attention_type attention_type = LLAMA_ATTENTION_TYPE_UNSPECIFIED;
+    // per-sequence KV streams keep a hybrid model's attention identical between two contexts whose sequences
+    // were decoded in a different order, so only the recurrent cells differ
+    bool kv_unified = true;
 };
 
 static llama_context * make_ctx_multi(const common_params & params, llama_model * model, uint8_t fill, const ctx_spec & spec) {
     auto cparams = common_context_params_to_llama(params);
     cparams.n_seq_max      = spec.n_seq_max;
     cparams.n_rs_seq       = spec.n_rs_seq;
-    cparams.n_ctx          = 1024;
+    cparams.n_ctx          = spec.kv_unified ? 1024 : std::max<uint32_t>(1024, spec.n_ubatch*spec.n_seq_max);
     cparams.n_batch        = 512;
     cparams.n_ubatch       = spec.n_ubatch;
-    cparams.kv_unified     = true;
+    cparams.kv_unified     = spec.kv_unified;
     cparams.attention_type = spec.attention_type;
     return init_ctx(model, cparams, fill);
 }
@@ -983,7 +986,7 @@ static bool run_relocation_rounds(const common_params & params, llama_model * mo
     constexpr llama_pos P = 12;
     constexpr uint32_t  K = 3; // the server's draft n_max
 
-    const ctx_spec spec = { n_seq_max, K, 512 };
+    const ctx_spec spec = { n_seq_max, K, 512, LLAMA_ATTENTION_TYPE_UNSPECIFIED, /*kv_unified*/ false };
     llama_context * roll = make_ctx_multi(params, model, fill, spec);
     llama_context * ref  = make_ctx_multi(params, model, fill, spec);
     if (roll == nullptr || ref == nullptr) {
