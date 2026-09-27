@@ -111,6 +111,8 @@ static double nmse(const float * a, const float * b, int n) {
 // ubatches while its rollback restore is still pending. Compared against a
 // reference context that never advanced past the rollback point and decodes
 // the identical replay batch.
+// The rolled-back tail is one ubatch of n_rollback + 1 tokens, so the anchor
+// token stays and the snapshot planes can serve the removal.
 static bool test_multi_seq_split_replay(const common_params & params, llama_model * model, const int n_vocab, uint8_t fill) {
     constexpr uint32_t  n_seqs     = 2;
     constexpr uint32_t  n_ubatch   = 16;
@@ -118,6 +120,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     constexpr uint32_t  n_rollback = 3;
     constexpr uint32_t  n_replay   = 40; // > n_ubatch so each seq spans multiple ubatches
     constexpr llama_pos p0         = n_prompt - n_rollback;
+    constexpr llama_pos p_tail     = p0 - 1; // the anchor
 
     const auto make_ctx_multi = [&]() {
         auto cparams = common_context_params_to_llama(params);
@@ -154,18 +157,24 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
 
     bool ok = true;
 
-    // both contexts decode the identical [0, p0) prefill; only ctx_roll decodes
-    // the tail, which is then rolled back so its restore is pending at replay
+    // ctx_ref decodes the [0, p0) prefill; ctx_roll stops one token earlier and
+    // decodes the anchor with the tail, which is then rolled back so its restore
+    // is pending at replay
     for (uint32_t s = 0; s < n_seqs && ok; ++s) {
         llama_batch batch = llama_batch_init(n_prompt, 0, 1);
         for (llama_pos pos = 0; pos < (llama_pos) p0; ++pos) {
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
-        ok = ok && llama_decode(ctx_roll, batch) == 0;
-        ok = ok && llama_decode(ctx_ref,  batch) == 0;
+        ok = ok && llama_decode(ctx_ref, batch) == 0;
 
         common_batch_clear(batch);
-        for (llama_pos pos = p0; pos < (llama_pos) n_prompt; ++pos) {
+        for (llama_pos pos = 0; pos < p_tail; ++pos) {
+            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+        }
+        ok = ok && llama_decode(ctx_roll, batch) == 0;
+
+        common_batch_clear(batch);
+        for (llama_pos pos = p_tail; pos < (llama_pos) n_prompt; ++pos) {
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
         ok = ok && llama_decode(ctx_roll, batch) == 0;
@@ -564,11 +573,20 @@ static std::vector<rs_row> seq_state(llama_context * ctx, llama_seq_id seq) {
     return collector.rows;
 }
 
+struct state_cmp {
+    bool        same = false;
+    double      max_abs = std::numeric_limits<double>::infinity();
+    double      nmse    = std::numeric_limits<double>::infinity();
+    std::string text; // empty when the states are equal
+};
+
 // Exact comparison, except that -0 and +0 are equal: the zeroed state is made by scaling the cell's previous
-// content by 0, which keeps the sign of negative values. Returns an empty string when the states are equal.
-static std::string state_diff(const std::vector<rs_row> & a, const std::vector<rs_row> & b) {
+// content by 0, which keeps the sign of negative values.
+static state_cmp compare_states(const std::vector<rs_row> & a, const std::vector<rs_row> & b) {
+    state_cmp res;
     if (a.size() != b.size()) {
-        return "(row count differs)";
+        res.text = "(row count differs)";
+        return res;
     }
     size_t n_rows  = 0;
     size_t n_elems = 0;
@@ -579,7 +597,8 @@ static std::string state_diff(const std::vector<rs_row> & a, const std::vector<r
     double sum_sq_ref  = 0.0;
     for (size_t r = 0; r < a.size(); ++r) {
         if (a[r].type != b[r].type || a[r].bytes.size() != b[r].bytes.size()) {
-            return "(row layout differs)";
+            res.text = "(row layout differs)";
+            return res;
         }
         const size_t es = ggml_type_size(a[r].type);
         size_t n_diff = 0;
@@ -620,14 +639,20 @@ static std::string state_diff(const std::vector<rs_row> & a, const std::vector<r
             n_elems += n_diff;
         }
     }
-    if (n_rows == 0) {
-        return "";
+    res.max_abs = max_abs;
+    res.nmse    = sum_sq_ref > 0.0 ? sum_sq_diff/sum_sq_ref : (sum_sq_diff > 0.0 ? std::numeric_limits<double>::infinity() : 0.0);
+    res.same    = n_rows == 0;
+    if (!res.same) {
+        char buf[192];
+        snprintf(buf, sizeof(buf), "(%zu rows, %zu elements differ, first at row %zu element %zu, max abs %g, nmse %g)",
+                 n_rows, n_elems, first_row, first_elem, res.max_abs, res.nmse);
+        res.text = buf;
     }
-    const double nmse_val = sum_sq_ref > 0.0 ? sum_sq_diff/sum_sq_ref : (sum_sq_diff > 0.0 ? std::numeric_limits<double>::infinity() : 0.0);
-    char buf[192];
-    snprintf(buf, sizeof(buf), "(%zu rows, %zu elements differ, first at row %zu element %zu, max abs %g, nmse %g)",
-             n_rows, n_elems, first_row, first_elem, max_abs, nmse_val);
-    return buf;
+    return res;
+}
+
+static std::string state_diff(const std::vector<rs_row> & a, const std::vector<rs_row> & b) {
+    return compare_states(a, b).text;
 }
 
 struct ctx_spec {
@@ -1058,6 +1083,230 @@ static bool test_relocation(const common_params & params, llama_model * model, i
     return all_ok;
 }
 
+// A partial seq_rm is served by the snapshot planes only when the cell belongs to the sequence alone, nothing is
+// pending, and the removal stays inside the last ubatch with the anchor kept. Everything else must be refused and
+// leave the memory untouched: the whole ubatch, a removal reaching past the last ubatch, a removal right after a
+// state load, one on a shared cell, one after a ubatch with repeated positions, and one after the attention was made
+// non-causal. Accepted removals continue from the anchor's state; the reference never decoded the removed tokens,
+// so its ubatch shapes differ and the comparison uses a tolerance far below the defect size.
+static bool test_refusal(const common_params & params, llama_model * model, int n_vocab, uint8_t fill) {
+    constexpr llama_pos P = 12;
+    constexpr double    nmse_ok = 1e-4;
+    const ctx_spec spec = { 2, 8, 64 };
+
+    bool all_ok = true;
+
+    const char * fn = __func__;
+    const auto report_refused = [&](llama_context * ctx, llama_seq_id seq, bool accepted, llama_pos pmax_before,
+                                    const std::vector<rs_row> & before, const char * name) {
+        if (accepted) {
+            fprintf(stderr, "%s : %s: accepted a removal the snapshots cannot serve\n", fn, name);
+            return false;
+        }
+        const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(ctx), seq);
+        const std::string diff = state_diff(seq_state(ctx, seq), before);
+        if (pmax != pmax_before || !diff.empty()) {
+            fprintf(stderr, "%s : %s: refused but changed the memory (pos %d -> %d) %s\n", fn, name, pmax_before, pmax, diff.c_str());
+            return false;
+        }
+        fprintf(stderr, "%s : %s: refused, memory unchanged\n", fn, name);
+        return true;
+    };
+
+    // ubatches of `steps` tokens after the prefix; tokens beyond the kept ones are rejected drafts (salt 1)
+    struct step_case {
+        const char *     name;
+        std::vector<int> steps;
+        int              rollback;
+        bool             expect_accept;
+    };
+    const step_case step_cases[] = {
+        { "whole ubatch of 1 by 1",                     { 1 },       1, false },
+        { "whole ubatch of 3 by 3",                     { 3 },       3, false },
+        { "whole ubatch of 8 by 8",                     { 8 },       8, false },
+        { "past the last ubatch, steps (3,2) by 4",     { 3, 2 },    4, false },
+        { "past the last ubatch, steps (1,1,1) by 2",   { 1, 1, 1 }, 2, false },
+        { "anchor in an earlier ubatch, steps (4,1) by 3", { 4, 1 }, 3, false },
+        { "control: anchored, ubatch of 3 by 2",        { 3 },       2, true  },
+        { "control: anchored, ubatch of 9 by 8",        { 9 },       8, true  },
+        { "control: anchored, steps (3,2) by 1",        { 3, 2 },    1, true  },
+    };
+    for (const auto & c : step_cases) {
+        llama_context * roll = make_ctx_multi(params, model, fill, spec);
+        llama_context * ref  = make_ctx_multi(params, model, fill, spec);
+        if (roll == nullptr || ref == nullptr) {
+            fprintf(stderr, "%s : failed to init contexts\n", __func__);
+            return false;
+        }
+        if (llama_n_rs_seq(roll) < 8) {
+            fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+            llama_free(roll);
+            llama_free(ref);
+            return true;
+        }
+        int total = 0;
+        for (const int n : c.steps) {
+            total += n;
+        }
+        const int keep = total - c.rollback;
+
+        bool ok = decode_specs(roll, tok_run(n_vocab, 0, 0, P)) == 0 && decode_specs(ref, tok_run(n_vocab, 0, 0, P)) == 0;
+        llama_pos p = P;
+        for (const int n : c.steps) {
+            std::vector<tokspec> step;
+            for (int i = 0; i < n; ++i, ++p) {
+                step.push_back({ 0, p, tok_at(n_vocab, 0, p, p < P + keep ? 0 : 1) });
+            }
+            ok = ok && decode_specs(roll, step) == 0;
+        }
+        if (keep > 0) {
+            ok = ok && decode_specs(ref, tok_run(n_vocab, 0, P, keep)) == 0;
+        }
+        if (!ok) {
+            fprintf(stderr, "%s : %s: setup failed\n", __func__, c.name);
+            llama_free(roll);
+            llama_free(ref);
+            return false;
+        }
+
+        const llama_pos pmax_before = llama_memory_seq_pos_max(llama_get_memory(roll), 0);
+        const auto before = seq_state(roll, 0);
+        const bool accepted = llama_memory_seq_rm(llama_get_memory(roll), 0, P + keep, -1);
+
+        if (!c.expect_accept) {
+            all_ok = report_refused(roll, 0, accepted, pmax_before, before, c.name) && all_ok;
+        } else if (!accepted) {
+            fprintf(stderr, "%s : %s: refused an anchored removal\n", __func__, c.name);
+            all_ok = false;
+        } else {
+            const std::vector<tokspec> next = { { 0, P + keep, tok_at(n_vocab, 0, P + keep) } };
+            ok = decode_specs(roll, next) == 0 && decode_specs(ref, next) == 0;
+            const state_cmp cmp = ok ? compare_states(seq_state(roll, 0), seq_state(ref, 0)) : state_cmp{};
+            const bool pass = ok && cmp.nmse <= nmse_ok;
+            fprintf(stderr, "%s : %s: accepted, state after continuing %s the reference (nmse %g)\n", __func__, c.name,
+                    pass ? "matches" : "DIFFERS from", cmp.nmse);
+            all_ok = all_ok && pass;
+        }
+        llama_free(roll);
+        llama_free(ref);
+    }
+
+    // after a state load only plane 0 is present; a later ubatch grants depth again
+    {
+        llama_context * src = make_ctx_multi(params, model, fill, spec);
+        llama_context * dst = make_ctx_multi(params, model, fill, spec);
+        if (src == nullptr || dst == nullptr) {
+            fprintf(stderr, "%s : failed to init contexts\n", __func__);
+            return false;
+        }
+        bool ok = decode_specs(src, tok_run(n_vocab, 0, 0, P)) == 0;
+        std::vector<uint8_t> blob(llama_state_seq_get_size(src, 0));
+        ok = ok && llama_state_seq_get_data(src, blob.data(), blob.size(), 0) == blob.size();
+        ok = ok && llama_state_seq_set_data(dst, blob.data(), blob.size(), 0) == blob.size();
+        if (!ok) {
+            fprintf(stderr, "%s : after load: setup failed\n", __func__);
+            llama_free(src);
+            llama_free(dst);
+            return false;
+        }
+        const llama_pos pmax_before = llama_memory_seq_pos_max(llama_get_memory(dst), 0);
+        const auto before = seq_state(dst, 0);
+        all_ok = report_refused(dst, 0, llama_memory_seq_rm(llama_get_memory(dst), 0, P - 2, -1), pmax_before, before, "right after a state load") && all_ok;
+
+        ok = decode_specs(dst, tok_cat(tok_run(n_vocab, 0, P, 2), tok_run(n_vocab, 0, P + 2, 2, 1))) == 0;
+        const bool accepted = ok && llama_memory_seq_rm(llama_get_memory(dst), 0, P + 2, -1);
+        fprintf(stderr, "%s : control: anchored removal after a load and a 4-token ubatch: %s\n", __func__, accepted ? "accepted" : "REFUSED");
+        all_ok = all_ok && accepted;
+        llama_free(src);
+        llama_free(dst);
+    }
+
+    // a cell shared after seq_cp: the removal would move both sequences
+    {
+        llama_context * ctx = make_ctx_multi(params, model, fill, spec);
+        if (ctx == nullptr) {
+            fprintf(stderr, "%s : failed to init context\n", __func__);
+            return false;
+        }
+        auto * mem = llama_get_memory(ctx);
+        bool ok = decode_specs(ctx, tok_run(n_vocab, 0, 0, P)) == 0;
+        ok = ok && llama_memory_seq_rm(mem, 1, -1, -1);
+        llama_memory_seq_cp(mem, 0, 1, -1, -1);
+        if (!ok) {
+            fprintf(stderr, "%s : shared cell: setup failed\n", __func__);
+            llama_free(ctx);
+            return false;
+        }
+        const llama_pos pmax_before = llama_memory_seq_pos_max(mem, 0);
+        const auto before = seq_state(ctx, 0);
+        all_ok = report_refused(ctx, 0, llama_memory_seq_rm(mem, 1, P - 2, -1), pmax_before, before, "on a shared cell") && all_ok;
+
+        // once the copy leaves, the owner may roll back again
+        ok = llama_memory_seq_rm(mem, 1, -1, -1);
+        const bool accepted = ok && llama_memory_seq_rm(mem, 0, P - 2, -1);
+        fprintf(stderr, "%s : control: anchored removal after the copy left the cell: %s\n", __func__, accepted ? "accepted" : "REFUSED");
+        all_ok = all_ok && accepted;
+        llama_free(ctx);
+    }
+
+    // repeated positions in one ubatch: a position difference no longer counts tokens
+    {
+        llama_context * ctx = make_ctx_multi(params, model, fill, spec);
+        if (ctx == nullptr) {
+            fprintf(stderr, "%s : failed to init context\n", __func__);
+            return false;
+        }
+        bool ok = decode_specs(ctx, tok_run(n_vocab, 0, 0, P)) == 0;
+        const std::vector<tokspec> repeated = { { 0, P, tok_at(n_vocab, 0, P) }, { 0, P + 1, tok_at(n_vocab, 0, P + 1, 1) }, { 0, P + 1, tok_at(n_vocab, 0, P + 1, 2) } };
+        const int rc = ok ? decode_specs(ctx, repeated) : -1;
+        if (!ok) {
+            fprintf(stderr, "%s : repeated positions: setup failed\n", __func__);
+            llama_free(ctx);
+            return false;
+        }
+        if (rc != 0) {
+            fprintf(stderr, "%s : repeated positions: skipped, the batch was rejected (rc %d)\n", __func__, rc);
+        } else {
+            const llama_pos pmax_before = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+            const auto before = seq_state(ctx, 0);
+            all_ok = report_refused(ctx, 0, llama_memory_seq_rm(llama_get_memory(ctx), 0, P + 1, -1), pmax_before, before, "after repeated positions") && all_ok;
+        }
+        llama_free(ctx);
+    }
+
+    // non-causal attention: the planes written since are not rollback history, causal again grants depth again
+    {
+        llama_context * ctx = make_ctx_multi(params, model, fill, spec);
+        if (ctx == nullptr) {
+            fprintf(stderr, "%s : failed to init context\n", __func__);
+            return false;
+        }
+        auto * mem = llama_get_memory(ctx);
+        const auto verify = [&](llama_pos p) {
+            return decode_specs(ctx, tok_cat(tok_run(n_vocab, 0, p, 2), tok_run(n_vocab, 0, p + 2, 2, 1))) == 0;
+        };
+        bool ok = decode_specs(ctx, tok_run(n_vocab, 0, 0, P)) == 0 && verify(P);
+        if (!ok) {
+            fprintf(stderr, "%s : non-causal: setup failed\n", __func__);
+            llama_free(ctx);
+            return false;
+        }
+        llama_set_causal_attn(ctx, false);
+        const llama_pos pmax_before = llama_memory_seq_pos_max(mem, 0);
+        const auto before = seq_state(ctx, 0);
+        all_ok = report_refused(ctx, 0, llama_memory_seq_rm(mem, 0, P + 2, -1), pmax_before, before, "after llama_set_causal_attn(false)") && all_ok;
+
+        llama_set_causal_attn(ctx, true);
+        ok = verify(P + 4);
+        const bool accepted = ok && llama_memory_seq_rm(mem, 0, P + 6, -1);
+        fprintf(stderr, "%s : control: anchored removal after causal attention is back: %s\n", __func__, accepted ? "accepted" : "REFUSED");
+        all_ok = all_ok && accepted;
+        llama_free(ctx);
+    }
+
+    return all_ok;
+}
+
 static bool model_is_deepseek4(llama_model * model) {
     char arch[64] = {0};
     llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
@@ -1083,6 +1332,9 @@ static int test_lifecycle(const common_params & params, llama_model * model, uin
         ret = 1;
     }
     if (!test_relocation(params, model, n_vocab, fill)) {
+        ret = 1;
+    }
+    if (!test_refusal(params, model, n_vocab, fill)) {
         ret = 1;
     }
     return ret;

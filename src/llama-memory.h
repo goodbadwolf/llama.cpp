@@ -129,6 +129,14 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    //
+    // recurrent rollback
+    //
+
+    // snapshots written under non-causal attention are not rollback history: while disabled, partial removals are
+    // refused and no new rollback depth is granted
+    virtual void set_rollback_enabled(bool enabled) { GGML_UNUSED(enabled); }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
