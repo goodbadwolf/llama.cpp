@@ -10,8 +10,10 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <set>
+#include <string>
 #include <vector>
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
@@ -482,6 +484,321 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     return 0;
 }
 
+//
+// multi-sequence lifecycle tests
+//
+// Each test drives a rolled-back context and a reference context through decodes of identical ubatch shapes and
+// compares the recurrent state a sequence continues from, as exported by the public state API, bitwise.
+
+struct tokspec {
+    llama_seq_id seq;
+    llama_pos    pos;
+    llama_token  tok;
+};
+
+// deterministic token per (seq, pos); a non-zero salt gives a different stream, e.g. rejected drafts
+static llama_token tok_at(int n_vocab, llama_seq_id seq, llama_pos pos, int salt = 0) {
+    return (llama_token) ((7u*(uint32_t) pos + 31u*(uint32_t) seq + 101u*(uint32_t) salt + 1u) % (uint32_t) n_vocab);
+}
+
+static std::vector<tokspec> tok_run(int n_vocab, llama_seq_id seq, llama_pos p0, int n, int salt = 0) {
+    std::vector<tokspec> v;
+    for (int i = 0; i < n; ++i) {
+        v.push_back({ seq, p0 + i, tok_at(n_vocab, seq, p0 + i, salt) });
+    }
+    return v;
+}
+
+static std::vector<tokspec> tok_cat(std::vector<tokspec> a, const std::vector<tokspec> & b) {
+    a.insert(a.end(), b.begin(), b.end());
+    return a;
+}
+
+static int decode_specs(llama_context * ctx, const std::vector<tokspec> & toks) {
+    llama_batch batch = llama_batch_init((int32_t) toks.size(), 0, 1);
+    for (const auto & t : toks) {
+        common_batch_add(batch, t.tok, t.pos, { t.seq }, true);
+    }
+    const int ret = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    return ret;
+}
+
+// The recurrent rows one sequence continues from, in state export order and honouring a pending rollback index.
+// Attention KV rows are skipped so that hybrid models compare only the state under test.
+struct rs_row {
+    ggml_type type;
+    std::vector<uint8_t> bytes;
+};
+
+struct rs_state_collector : llama_io_write_i {
+    std::vector<rs_row> rows;
+    size_t size = 0;
+
+    void write(const void *, size_t n) override {
+        size += n;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t n) override {
+        size += n;
+        const std::string name = ggml_get_name(tensor);
+        const bool recurrent = name.rfind("cache_r_l", 0) == 0 || name.rfind("cache_s_l", 0) == 0 ||
+                               name.rfind("cache_ple_r_l", 0) == 0 || name.rfind("dsv4_", 0) == 0;
+        if (!recurrent || n == 0) {
+            return;
+        }
+        rs_row row { tensor->type, std::vector<uint8_t>(n) };
+        ggml_backend_tensor_get(tensor, row.bytes.data(), offset, n);
+        rows.push_back(std::move(row));
+    }
+
+    size_t n_bytes() override {
+        return size;
+    }
+};
+
+static std::vector<rs_row> seq_state(llama_context * ctx, llama_seq_id seq) {
+    llama_synchronize(ctx);
+    rs_state_collector collector;
+    llama_get_memory(ctx)->state_write(collector, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    return collector.rows;
+}
+
+// Exact comparison, except that -0 and +0 are equal: the zeroed state is made by scaling the cell's previous
+// content by 0, which keeps the sign of negative values. Returns an empty string when the states are equal.
+static std::string state_diff(const std::vector<rs_row> & a, const std::vector<rs_row> & b) {
+    if (a.size() != b.size()) {
+        return "(row count differs)";
+    }
+    size_t n_rows  = 0;
+    size_t n_elems = 0;
+    size_t first_row  = 0;
+    size_t first_elem = 0;
+    double max_abs = 0.0;
+    double sum_sq_diff = 0.0;
+    double sum_sq_ref  = 0.0;
+    for (size_t r = 0; r < a.size(); ++r) {
+        if (a[r].type != b[r].type || a[r].bytes.size() != b[r].bytes.size()) {
+            return "(row layout differs)";
+        }
+        const size_t es = ggml_type_size(a[r].type);
+        size_t n_diff = 0;
+        for (size_t i = 0; i < a[r].bytes.size()/es; ++i) {
+            const uint8_t * x = a[r].bytes.data() + i*es;
+            const uint8_t * y = b[r].bytes.data() + i*es;
+            bool equal;
+            if (a[r].type == GGML_TYPE_F32 || a[r].type == GGML_TYPE_F16) {
+                float fx, fy;
+                if (a[r].type == GGML_TYPE_F32) {
+                    memcpy(&fx, x, sizeof(fx));
+                    memcpy(&fy, y, sizeof(fy));
+                } else {
+                    ggml_fp16_t hx, hy;
+                    memcpy(&hx, x, sizeof(hx));
+                    memcpy(&hy, y, sizeof(hy));
+                    fx = ggml_fp16_to_fp32(hx);
+                    fy = ggml_fp16_to_fp32(hy);
+                }
+                equal = fx == fy;
+                const double d = (double) fx - fy;
+                max_abs = std::isfinite(d) ? std::max(max_abs, std::fabs(d)) : std::numeric_limits<double>::infinity();
+                sum_sq_diff += d*d;
+                sum_sq_ref  += (double) fy*fy;
+            } else {
+                equal = memcmp(x, y, es) == 0;
+            }
+            if (!equal) {
+                if (n_elems == 0 && n_diff == 0) {
+                    first_row  = r;
+                    first_elem = i;
+                }
+                ++n_diff;
+            }
+        }
+        if (n_diff > 0) {
+            ++n_rows;
+            n_elems += n_diff;
+        }
+    }
+    if (n_rows == 0) {
+        return "";
+    }
+    const double nmse_val = sum_sq_ref > 0.0 ? sum_sq_diff/sum_sq_ref : (sum_sq_diff > 0.0 ? std::numeric_limits<double>::infinity() : 0.0);
+    char buf[192];
+    snprintf(buf, sizeof(buf), "(%zu rows, %zu elements differ, first at row %zu element %zu, max abs %g, nmse %g)",
+             n_rows, n_elems, first_row, first_elem, max_abs, nmse_val);
+    return buf;
+}
+
+struct ctx_spec {
+    uint32_t n_seq_max;
+    uint32_t n_rs_seq;
+    uint32_t n_ubatch;
+};
+
+static llama_context * make_ctx_multi(const common_params & params, llama_model * model, uint8_t fill, const ctx_spec & spec) {
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_seq_max  = spec.n_seq_max;
+    cparams.n_rs_seq   = spec.n_rs_seq;
+    cparams.n_ctx      = 1024;
+    cparams.n_batch    = 512;
+    cparams.n_ubatch   = spec.n_ubatch;
+    cparams.kv_unified = true;
+    return init_ctx(model, cparams, fill);
+}
+
+// the exported state must tell two histories apart, otherwise every bitwise comparison below is vacuous
+static bool test_state_instrument(const common_params & params, llama_model * model, int n_vocab, uint8_t fill) {
+    const ctx_spec spec = { 1, 8, 64 };
+    llama_context * a = make_ctx_multi(params, model, fill, spec);
+    llama_context * b = make_ctx_multi(params, model, fill, spec);
+    if (a == nullptr || b == nullptr) {
+        fprintf(stderr, "%s : failed to init contexts\n", __func__);
+        return false;
+    }
+    bool ok = decode_specs(a, tok_run(n_vocab, 0, 0, 12)) == 0 && decode_specs(b, tok_run(n_vocab, 0, 0, 12)) == 0;
+    const auto sa = seq_state(a, 0);
+    ok = ok && !sa.empty() && state_diff(sa, seq_state(b, 0)).empty();
+    ok = ok && decode_specs(b, tok_run(n_vocab, 0, 12, 1)) == 0;
+    ok = ok && !state_diff(sa, seq_state(b, 0)).empty();
+    llama_free(a);
+    llama_free(b);
+    if (!ok) {
+        fprintf(stderr, "%s : exported state does not discriminate histories\n", __func__);
+        return false;
+    }
+    return true;
+}
+
+// A pending rollback index must not outlive the sequence's stay in its cell. After seq_keep or a finite seq_rm the
+// next conversation on that seq id must start from the zero state, and a seq_cp from a rolled-back sequence must
+// continue from the rolled-back state. Each variant runs once without a pending index as its control.
+static bool test_pending_index_lifecycle(const common_params & params, llama_model * model, int n_vocab, uint8_t fill) {
+    constexpr llama_pos P = 12;
+    constexpr llama_pos R = 2;
+    const ctx_spec spec = { 2, 8, 64 };
+
+    enum op_t { OP_SEQ_KEEP, OP_FINITE_RM, OP_SEQ_CP_ONTO, OP_SEQ_CP_FROM };
+    const std::pair<op_t, const char *> variants[] = {
+        { OP_SEQ_KEEP,    "seq_keep"           },
+        { OP_FINITE_RM,   "finite seq_rm"      },
+        { OP_SEQ_CP_ONTO, "seq_cp onto seq 1"  },
+        { OP_SEQ_CP_FROM, "seq_cp from seq 0"  },
+    };
+
+    bool all_ok = true;
+    for (const auto & [op, name] : variants) {
+        for (bool pending : { false, true }) {
+            llama_context * roll = make_ctx_multi(params, model, fill, spec);
+            llama_context * ref  = make_ctx_multi(params, model, fill, spec);
+            if (roll == nullptr || ref == nullptr) {
+                fprintf(stderr, "%s : failed to init contexts\n", __func__);
+                return false;
+            }
+            if (llama_n_rs_seq(roll) < (uint32_t) R) {
+                fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+                llama_free(roll);
+                llama_free(ref);
+                return true;
+            }
+            auto * mem = llama_get_memory(roll);
+
+            bool ok = decode_specs(roll, tok_run(n_vocab, 0, 0, P)) == 0 &&
+                      decode_specs(roll, tok_run(n_vocab, 1, 0, P)) == 0;
+
+            // the rolled-back sequence keeps its anchor, so the request is one the snapshots can serve
+            const llama_seq_id seq_pending = op == OP_SEQ_CP_FROM ? 0 : 1;
+            if (pending) {
+                ok = ok && llama_memory_seq_rm(mem, seq_pending, P - R, -1);
+            }
+
+            std::vector<tokspec> next_roll;
+            std::vector<tokspec> next_ref;
+            llama_seq_id seq_ref = 0;
+            switch (op) {
+                case OP_SEQ_KEEP:
+                case OP_FINITE_RM:
+                    if (op == OP_SEQ_KEEP) {
+                        llama_memory_seq_keep(mem, 0);
+                    } else if (!llama_memory_seq_rm(mem, 1, 0, 100000)) {
+                        fprintf(stderr, "%s : %s%s: skipped, this memory refuses a finite removal\n", __func__, pending ? "" : "control ", name);
+                        llama_free(roll);
+                        llama_free(ref);
+                        continue;
+                    }
+                    // a new conversation starts on seq 1 from the zero state
+                    next_roll = { { 1, 0, tok_at(n_vocab, 1, 0, 3) } };
+                    next_ref  = { { 1, 0, tok_at(n_vocab, 1, 0, 3) } };
+                    seq_ref   = 1;
+                    break;
+                case OP_SEQ_CP_ONTO:
+                    // seq 1 becomes a copy of seq 0 and continues seq 0's conversation. The removal first is the
+                    // server's protocol: the unified KV cache's seq_cp only adds the destination to the source cells.
+                    ok = ok && llama_memory_seq_rm(mem, 1, -1, -1);
+                    llama_memory_seq_cp(mem, 0, 1, -1, -1);
+                    ok = ok && decode_specs(ref, tok_run(n_vocab, 0, 0, P)) == 0;
+                    next_roll = { { 1, P, tok_at(n_vocab, 0, P) } };
+                    next_ref  = { { 0, P, tok_at(n_vocab, 0, P) } };
+                    break;
+                case OP_SEQ_CP_FROM: {
+                    // seq 1 becomes a copy of seq 0 while seq 0's rollback is pending, and continues from there
+                    ok = ok && llama_memory_seq_rm(mem, 1, -1, -1);
+                    llama_memory_seq_cp(mem, 0, 1, -1, -1);
+                    ok = ok && decode_specs(ref, tok_run(n_vocab, 0, 0, P)) == 0;
+                    if (pending) {
+                        ok = ok && llama_memory_seq_rm(llama_get_memory(ref), 0, P - R, -1);
+                    }
+                    const llama_pos p = pending ? P - R : P;
+                    next_roll = { { 1, p, tok_at(n_vocab, 0, p) } };
+                    next_ref  = { { 0, p, tok_at(n_vocab, 0, p) } };
+                    break;
+                }
+            }
+
+            ok = ok && decode_specs(roll, next_roll) == 0;
+            ok = ok && decode_specs(ref,  next_ref)  == 0;
+            if (!ok) {
+                fprintf(stderr, "%s : %s%s: setup failed\n", __func__, pending ? "" : "control ", name);
+                llama_free(roll);
+                llama_free(ref);
+                return false;
+            }
+
+            const std::string diff = state_diff(seq_state(roll, 1), seq_state(ref, seq_ref));
+            llama_free(roll);
+            llama_free(ref);
+
+            fprintf(stderr, "%s : %s%s: state after continue %s the reference %s\n", __func__,
+                    pending ? "" : "control ", name, diff.empty() ? "matches" : "DIFFERS from", diff.c_str());
+            all_ok = all_ok && diff.empty();
+        }
+    }
+    return all_ok;
+}
+
+static bool model_is_deepseek4(llama_model * model) {
+    char arch[64] = {0};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    return strcmp(arch, "deepseek4") == 0;
+}
+
+static int test_lifecycle(const common_params & params, llama_model * model, uint8_t fill) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    if (model_is_deepseek4(model)) {
+        // DeepSeek V4 keeps its rollback state in llama_kv_cache_dsv4, which does not implement these rules yet
+        fprintf(stderr, "%s : skipping for DeepSeek V4\n", __func__);
+        return 0;
+    }
+    if (!test_state_instrument(params, model, n_vocab, fill)) {
+        return 1;
+    }
+    if (!test_pending_index_lifecycle(params, model, n_vocab, fill)) {
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -509,12 +826,16 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    int ret = 0;
     for (uint8_t fill : { 0, 0x3e }) {
         fprintf(stderr, "%s : testing with cache fill 0x%02x\n", __func__, fill);
         if (test_rollback(params, model, fill) != 0) {
-            return 1;
+            ret = 1;
+        }
+        if (test_lifecycle(params, model, fill) != 0) {
+            ret = 1;
         }
     }
 
-    return 0;
+    return ret;
 }
