@@ -729,7 +729,12 @@ static bool test_pending_index_lifecycle(const common_params & params, llama_mod
 
     bool all_ok = true;
     for (const auto & [op, name] : variants) {
-        const ctx_spec spec = { 2, 8, 64 };
+        // The copy variants use per-sequence KV streams: the KV cache's cross-stream seq_cp replaces the
+        // destination, so no removal is needed before the copy and a stale destination index is reachable, and the
+        // copied sequence's attention has the same layout as the reference's. The KV cache's seq_keep clears only
+        // the kept sequence's stream, so the removal variants stay unified.
+        const bool copies = op == OP_SEQ_CP_ONTO || op == OP_SEQ_CP_FROM || op == OP_SEQ_CP_SELF;
+        const ctx_spec spec = { 2, 8, 64, LLAMA_ATTENTION_TYPE_UNSPECIFIED, /*kv_unified*/ !copies };
 
         for (bool pending : { false, true }) {
             llama_context * roll = make_ctx_multi(params, model, fill, spec);
@@ -782,9 +787,7 @@ static bool test_pending_index_lifecycle(const common_params & params, llama_mod
                     seq_ref   = 1;
                     break;
                 case OP_SEQ_CP_ONTO:
-                    // seq 1 becomes a copy of seq 0 and continues seq 0's conversation. The removal first is the
-                    // server's protocol: the unified KV cache's seq_cp only adds the destination to the source cells.
-                    ok = ok && llama_memory_seq_rm(mem, 1, -1, -1);
+                    // seq 1 becomes a copy of seq 0 and continues seq 0's conversation
                     llama_memory_seq_cp(mem, 0, 1, -1, -1);
                     ok = ok && decode_specs(ref, tok_run(n_vocab, 0, 0, P)) == 0;
                     next_roll = { { 1, P, tok_at(n_vocab, 0, P) } };
@@ -795,9 +798,6 @@ static bool test_pending_index_lifecycle(const common_params & params, llama_mod
                     // seq 1 (or seq 0 itself) becomes a copy of seq 0 while seq 0's rollback is pending, and
                     // continues from there
                     const llama_seq_id dst = op == OP_SEQ_CP_SELF ? 0 : 1;
-                    if (dst != 0) {
-                        ok = ok && llama_memory_seq_rm(mem, dst, -1, -1);
-                    }
                     llama_memory_seq_cp(mem, 0, dst, -1, -1);
                     ok = ok && decode_specs(ref, tok_run(n_vocab, 0, 0, P)) == 0;
                     if (pending) {
