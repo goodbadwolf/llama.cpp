@@ -1524,6 +1524,10 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(p0 <= 0 && p1 < 0 && "DSV4 only supports full sequence copies");
 
+    if (seq_id_src == seq_id_dst) {
+        return;
+    }
+
     kv_raw->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     kv_csa->seq_cp(seq_id_src, seq_id_dst, -1, -1);
     kv_hca->seq_cp(seq_id_src, seq_id_dst, -1, -1);
@@ -1537,11 +1541,9 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     hca_state->seq_cp(plane_src*hca_state->get_n_stream() + seq_id_src, seq_id_dst);
     lid_state->seq_cp(plane_src*lid_state->get_n_stream() + seq_id_src, seq_id_dst);
 
-    if (seq_id_src != seq_id_dst) {
-        // only the current plane is copied
-        rs_idx[seq_id_dst]   = 0;
-        rs_depth[seq_id_dst] = 0;
-    }
+    // only the current plane is copied
+    rs_idx[seq_id_dst]   = 0;
+    rs_depth[seq_id_dst] = 0;
 }
 
 void llama_kv_cache_dsv4::seq_keep(llama_seq_id seq_id) {
