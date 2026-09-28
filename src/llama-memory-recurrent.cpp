@@ -791,13 +791,14 @@ std::vector<llama_seq_id> llama_memory_recurrent::revert_slot(const llama_ubatch
     }
     backup.valid = false;
 
-    // The cells the graph may have written: the members' cells, and the cells that received plane 0 of a relocated
-    // non-member (its old cell is by then a member's). Whether those writes ran is unknown.
+    // The cells the graph may have written: the members' cells, the cells that received plane 0 of a relocated
+    // non-member (its old cell is by then a member's), and the empty cells in the range, which the zeroed state and
+    // the extra-state copy write. Whether those writes ran is unknown.
     std::vector<bool> written(size, false);
     if (graph_ran) {
         for (uint32_t i = 0; i < n; ++i) {
             const int32_t c = head + i;
-            written[c] = i < ubatch.n_seqs || (!cells[c].is_empty() && cells[c].src0 != c);
+            written[c] = i < ubatch.n_seqs || cells[c].is_empty() || cells[c].src0 != c;
         }
     }
 
