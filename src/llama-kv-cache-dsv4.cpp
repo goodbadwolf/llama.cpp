@@ -1782,9 +1782,8 @@ std::vector<llama_seq_id> llama_kv_cache_dsv4::revert_ubatch(const std::vector<l
                                                              const std::vector<uint32_t> & rs_idx_prev) {
     std::vector<llama_seq_id> dropped;
 
-    // The plans consumed the pending rollback of every sequence in the batch when the context was built. The
-    // ubatches before this one ran their restores; this one and the later ones did not, so their sequences get
-    // their indices back unless an earlier ubatch already restored them.
+    // apply() consumed the pending rollback of this ubatch's sequences. The ubatches before this one ran their
+    // restores, so a sequence gets its index back only if none of them touched it.
     std::vector<bool> restored_earlier(n_seq_max, false);
     for (size_t j = 0; j < i_ubatch; ++j) {
         for (uint32_t t = 0; t < ubatches[j].n_seqs_unq; ++t) {
@@ -1794,16 +1793,15 @@ std::vector<llama_seq_id> llama_kv_cache_dsv4::revert_ubatch(const std::vector<l
             }
         }
     }
-    for (size_t j = i_ubatch; j < ubatches.size(); ++j) {
-        for (uint32_t t = 0; t < ubatches[j].n_seqs_unq; ++t) {
-            const llama_seq_id seq_id = ubatches[j].seq_id_unq[t];
-            if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max && !restored_earlier[seq_id] && (size_t) seq_id < rs_idx_prev.size()) {
-                rs_idx[seq_id] = rs_idx_prev[seq_id];
-            }
-        }
-    }
 
     const llama_ubatch & ubatch = ubatches[i_ubatch];
+
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+        if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max && !restored_earlier[seq_id] && (size_t) seq_id < rs_idx_prev.size()) {
+            rs_idx[seq_id] = rs_idx_prev[seq_id];
+        }
+    }
 
     for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
         const llama_seq_id seq_id = ubatch.seq_id_unq[s];
@@ -2216,7 +2214,6 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     hca_state(kv->get_hca_state()),
     lid_state(kv->get_lid_state()),
     status(ctx_raw->get_status()) {
-    kv->reset_rs_idx_for_ubatches(this->ubatches);
 }
 
 llama_kv_cache_dsv4_context::~llama_kv_cache_dsv4_context() = default;
@@ -2254,6 +2251,10 @@ bool llama_kv_cache_dsv4_context::apply() {
         hca_state->apply_copies(sc_info_hca);
         lid_state->apply_copies(sc_info_lid);
     } else if (kv != nullptr) {
+        // the plans built at construction restore a pending rollback in the first ubatch touching its sequence;
+        // the index is consumed here, when that ubatch runs, so an earlier failure leaves it in place
+        kv->reset_rs_idx_for_ubatches({ ubatches[i_next] });
+
         rs_depth_prev = kv->get_rs_depth();
         kv->grant_rs_depth(ubatches[i_next]);
     }
