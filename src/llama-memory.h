@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -62,7 +63,8 @@ struct llama_memory_context_i {
     // undo what apply() did for the current ubatch after the ubatch failed
     // when graph_ran is true the graph may have written to the memory, so state that could have been
     // overwritten is removed instead of restored
-    virtual void revert(bool graph_ran) { GGML_UNUSED(graph_ran); }
+    // returns the sequences whose state was lost, so that the caller can remove them from every memory
+    virtual std::vector<llama_seq_id> revert(bool graph_ran) { GGML_UNUSED(graph_ran); return {}; }
 
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;

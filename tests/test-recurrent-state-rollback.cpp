@@ -678,10 +678,14 @@ static llama_context * make_ctx_multi(const common_params & params, llama_model 
     return init_ctx(model, cparams, fill);
 }
 
-static bool model_is_deepseek4(llama_model * model) {
+static bool model_is_arch(llama_model * model, const char * name) {
     char arch[64] = {0};
     llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
-    return strcmp(arch, "deepseek4") == 0;
+    return strcmp(arch, name) == 0;
+}
+
+static bool model_is_deepseek4(llama_model * model) {
+    return model_is_arch(model, "deepseek4");
 }
 
 // the exported state must tell two histories apart, otherwise every bitwise comparison below is vacuous
@@ -713,7 +717,6 @@ static bool test_state_instrument(const common_params & params, llama_model * mo
 static bool test_pending_index_lifecycle(const common_params & params, llama_model * model, int n_vocab, uint8_t fill) {
     constexpr llama_pos P = 12;
     constexpr llama_pos R = 2;
-    const ctx_spec spec = { 2, 8, 64 };
 
     enum op_t { OP_SEQ_KEEP, OP_FINITE_RM, OP_SEQ_CP_ONTO, OP_SEQ_CP_FROM };
     const std::pair<op_t, const char *> variants[] = {
@@ -725,6 +728,8 @@ static bool test_pending_index_lifecycle(const common_params & params, llama_mod
 
     bool all_ok = true;
     for (const auto & [op, name] : variants) {
+        const ctx_spec spec = { 2, 8, 64 };
+
         for (bool pending : { false, true }) {
             llama_context * roll = make_ctx_multi(params, model, fill, spec);
             llama_context * ref  = make_ctx_multi(params, model, fill, spec);
@@ -839,30 +844,33 @@ static bool abort_cb(void * data) {
 
 // After a decode fails part-way, a sequence must either be gone or stand exactly where it stood before the failed
 // ubatch, with the same state. Claiming positions the graph never computed is the failure this checks for.
-static bool check_after_failure(llama_context * ctx, llama_seq_id seq, llama_pos pos_before,
-                                const std::vector<rs_row> & state_before, const char * what) {
+// Returns 1 when the sequence was dropped, 0 when it is intact and -1 when the check failed.
+static int check_after_failure(llama_context * ctx, llama_seq_id seq, llama_pos pos_before,
+                               const std::vector<rs_row> & state_before, const char * what) {
     const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(ctx), seq);
     if (pmax == -1) {
         fprintf(stderr, "%s : %s: seq %d was dropped\n", __func__, what, seq);
-        return true;
+        return 1;
     }
     if (pmax != pos_before) {
         fprintf(stderr, "%s : %s: seq %d claims positions up to %d that were never computed\n", __func__, what, seq, pmax);
-        return false;
+        return -1;
     }
     const std::string diff = state_diff(seq_state(ctx, seq), state_before);
     if (!diff.empty()) {
         fprintf(stderr, "%s : %s: seq %d kept its position but its state changed %s\n", __func__, what, seq, diff.c_str());
-        return false;
+        return -1;
     }
     fprintf(stderr, "%s : %s: seq %d is intact\n", __func__, what, seq);
-    return true;
+    return 0;
 }
 
 // A ubatch that fails after find_slot has claimed its positions, and may have moved or partly written cells.
-// Afterwards every sequence must be either gone or exactly as it was. The cases cover a failed span longer than the
-// snapshot depth, no snapshots at all, a verify ubatch, a decode with a pending rollback, and a ubatch that
-// relocates a sequence which is not in it.
+// Afterwards every sequence must be either gone or exactly as it was, and a dropped sequence must be gone from every
+// memory, so restarting it at position 0 matches a fresh context. The cases cover a failed span longer than the
+// snapshot depth, no snapshots at all, a verify ubatch, a decode with a pending rollback, a ubatch that relocates a
+// sequence which is not in it, a coupled token that lands in a cell a removed sequence gets back, and a first ubatch
+// failing while a later ubatch's sequence has a pending rollback.
 static bool test_failed_ubatch(const common_params & params, llama_model * model, int n_vocab, uint8_t fill) {
     constexpr llama_pos P = 12;
 
@@ -871,34 +879,45 @@ static bool test_failed_ubatch(const common_params & params, llama_model * model
         uint32_t                  n_seq_max;
         uint32_t                  n_rs_seq;
         std::vector<llama_seq_id> prefix_order; // each decodes P tokens, in this order, so cells need not follow seq ids
-        bool                      pending;      // seq 0 verifies 4 tokens, accepts 2 and rolls back 2 first
+        llama_seq_id              pending;      // this seq verifies 4 tokens, accepts 2 and rolls back 2 first (-1: none)
         bool                      shared;       // seq 1 becomes a copy of seq 0, so both own one cell
-        std::vector<llama_seq_id> abort_seqs;   // the aborted ubatch: n_tokens for each of these
-        int                       n_tokens;
+        bool                      copy_to_2;    // seq 2 becomes a copy of seq 0, so seq 0's cell is shared
+        bool                      coupled;      // the aborted ubatch is one token owned by all abort_seqs
+        std::vector<llama_seq_id> abort_seqs;   // the aborted ubatch: n_tokens[i] tokens for abort_seqs[i]
+        std::vector<int>          n_tokens;
         int                       countdown;    // abort at this callback check: 0 is before any node
         std::vector<llama_seq_id> check;
     };
     const abort_case cases[] = {
-        { "abort of a 16-token ubatch with n_rs_seq 8",       1, 8, { 0 },       false, false, { 0 },    16,  0, { 0 } },
-        { "abort of a 4-token ubatch with n_rs_seq 0",        1, 0, { 0 },       false, false, { 0 },     4,  0, { 0 } },
-        { "abort of a 4-token verify ubatch",                 1, 8, { 0 },       false, false, { 0 },     4,  0, { 0 } },
-        { "abort of a 4-token verify ubatch mid-graph",       1, 8, { 0 },       false, false, { 0 },     4, 40, { 0 } },
-        { "abort of a decode after a pending rollback",       1, 8, { 0 },       true,  false, { 0 },     1,  0, { 0 } },
-        { "abort of a ubatch that relocates a non-member",    3, 8, { 1, 0, 2 }, false, false, { 1, 2 },  1,  0, { 0, 1, 2 } },
-        { "abort of a decode of a seq that shares its cell",  2, 8, { 0 },       false, true,  { 1 },     1,  0, { 0, 1 } },
-        { "control: abort with ordered cells, nothing moves", 3, 8, { 0, 1, 2 }, false, false, { 1, 2 },  1,  0, { 0 } },
+        { "abort of a 16-token ubatch with n_rs_seq 8",               1, 8, { 0 },       -1, false, false, false, { 0 },    { 16 },   0, { 0 } },
+        { "abort of a 4-token ubatch with n_rs_seq 0",                1, 0, { 0 },       -1, false, false, false, { 0 },    { 4 },    0, { 0 } },
+        { "abort of a 4-token verify ubatch",                         1, 8, { 0 },       -1, false, false, false, { 0 },    { 4 },    0, { 0 } },
+        { "abort of a 4-token verify ubatch mid-graph",               1, 8, { 0 },       -1, false, false, false, { 0 },    { 4 },   40, { 0 } },
+        { "abort of a decode after a pending rollback",               1, 8, { 0 },        0, false, false, false, { 0 },    { 1 },    0, { 0 } },
+        { "abort of a ubatch that relocates a non-member",            3, 8, { 1, 0, 2 }, -1, false, false, false, { 1, 2 }, { 1, 1 }, 0, { 0, 1, 2 } },
+        { "abort of a decode of a seq that shares its cell",          2, 8, { 0 },       -1, true,  false, false, { 1 },    { 1 },    0, { 0, 1 } },
+        { "abort mid-graph of a coupled token landing in a freed cell", 3, 8, { 0, 1 },   -1, false, true,  true,  { 0, 1 }, { 1 },   40, { 0, 1, 2 } },
+        { "abort of the first ubatch while the next one's seq has a pending rollback", 2, 8, { 0, 1 }, 1, false, false, false, { 0, 1 }, { 4, 1 }, 0, { 0, 1 } },
+        { "control: abort with ordered cells, nothing moves",         3, 8, { 0, 1, 2 }, -1, false, false, false, { 1, 2 }, { 1, 1 }, 0, { 0 } },
     };
 
     bool all_ok = true;
     for (const auto & c : cases) {
-        llama_context * ctx = make_ctx_multi(params, model, fill, { c.n_seq_max, c.n_rs_seq, 64 });
+        const ctx_spec spec = { c.n_seq_max, c.n_rs_seq, 64 };
+        llama_context * ctx = make_ctx_multi(params, model, fill, spec);
         if (ctx == nullptr) {
             fprintf(stderr, "%s : failed to init context\n", __func__);
             return false;
         }
         auto * mem = llama_get_memory(ctx);
-        if (c.pending && llama_n_rs_seq(ctx) == 0) {
+        if (c.pending >= 0 && llama_n_rs_seq(ctx) == 0) {
             fprintf(stderr, "%s : %s: skipped, rollback is disabled for this context\n", __func__, c.name);
+            llama_free(ctx);
+            continue;
+        }
+        if (c.coupled && model_is_arch(model, "qwen4exp")) {
+            // its PLE n-gram embeddings assert on tokens shared by several sequences
+            fprintf(stderr, "%s : %s: skipped, the model does not take tokens shared by sequences\n", __func__, c.name);
             llama_free(ctx);
             continue;
         }
@@ -906,30 +925,46 @@ static bool test_failed_ubatch(const common_params & params, llama_model * model
         llama_set_abort_callback(ctx, abort_cb, &ctl);
 
         bool ok = true;
+        std::vector<llama_pos> pos(c.n_seq_max, P - 1); // where each sequence stands before the aborted ubatch
         for (const llama_seq_id s : c.prefix_order) {
             ok = ok && decode_specs(ctx, tok_run(n_vocab, s, 0, P)) == 0;
         }
-        llama_pos pos0 = P - 1;
-        if (c.pending) {
-            ok = ok && decode_specs(ctx, tok_cat(tok_run(n_vocab, 0, P, 2), tok_run(n_vocab, 0, P + 2, 2, 1))) == 0;
-            ok = ok && llama_memory_seq_rm(mem, 0, P + 2, -1);
-            pos0 = P + 1;
+        if (c.pending >= 0) {
+            const llama_seq_id s = c.pending;
+            ok = ok && decode_specs(ctx, tok_cat(tok_run(n_vocab, s, P, 2), tok_run(n_vocab, s, P + 2, 2, 1))) == 0;
+            ok = ok && llama_memory_seq_rm(mem, s, P + 2, -1);
+            pos[s] = P + 1;
         }
         if (c.shared) {
             ok = ok && llama_memory_seq_rm(mem, 1, -1, -1);
             llama_memory_seq_cp(mem, 0, 1, -1, -1);
+            pos[1] = pos[0];
         }
+        if (c.copy_to_2) {
+            llama_memory_seq_cp(mem, 0, 2, -1, -1);
+            pos[2] = pos[0];
+        }
+        llama_synchronize(ctx);
         std::vector<std::vector<rs_row>> before;
         for (const llama_seq_id s : c.check) {
             before.push_back(seq_state(ctx, s));
         }
 
-        std::vector<tokspec> aborted;
-        for (const llama_seq_id s : c.abort_seqs) {
-            aborted = tok_cat(aborted, tok_run(n_vocab, s, s == 0 ? pos0 + 1 : P, c.n_tokens, 1));
-        }
+        int rc;
         ctl.countdown = c.countdown;
-        const int rc = decode_specs(ctx, aborted);
+        if (c.coupled) {
+            llama_batch batch = llama_batch_init(1, 0, (int32_t) c.abort_seqs.size());
+            common_batch_add(batch, tok_at(n_vocab, c.abort_seqs[0], pos[c.abort_seqs[0]] + 1, 1), pos[c.abort_seqs[0]] + 1, c.abort_seqs, true);
+            rc = llama_decode(ctx, batch);
+            llama_batch_free(batch);
+        } else {
+            std::vector<tokspec> aborted;
+            for (size_t i = 0; i < c.abort_seqs.size(); ++i) {
+                const llama_seq_id s = c.abort_seqs[i];
+                aborted = tok_cat(aborted, tok_run(n_vocab, s, pos[s] + 1, c.n_tokens[i], 1));
+            }
+            rc = decode_specs(ctx, aborted);
+        }
         ctl.countdown = -1;
         if (!ok) {
             fprintf(stderr, "%s : %s: setup failed\n", __func__, c.name);
@@ -937,13 +972,41 @@ static bool test_failed_ubatch(const common_params & params, llama_model * model
             return false;
         }
         if (rc == 0) {
-            fprintf(stderr, "%s : %s: skipped, the decode was not aborted\n", __func__, c.name);
+            // an abort before any node must always take; deeper into the graph a backend may check less often
+            fprintf(stderr, "%s : %s: %s, the decode was not aborted\n", __func__, c.name, c.countdown == 0 ? "FAILED" : "skipped");
+            all_ok = all_ok && c.countdown != 0;
             llama_free(ctx);
             continue;
         }
+        std::vector<llama_seq_id> dropped;
         for (size_t i = 0; i < c.check.size(); ++i) {
             const llama_seq_id s = c.check[i];
-            all_ok = check_after_failure(ctx, s, s == 0 ? pos0 : P - 1, before[i], c.name) && all_ok;
+            const int res = check_after_failure(ctx, s, pos[s], before[i], c.name);
+            all_ok = all_ok && res >= 0;
+            if (res == 1) {
+                dropped.push_back(s);
+            }
+        }
+
+        // a dropped sequence must be gone from every memory a hybrid model has, or its restart sees old attention
+        if (!dropped.empty()) {
+            llama_context * ref = make_ctx_multi(params, model, fill, spec);
+            if (ref == nullptr) {
+                fprintf(stderr, "%s : failed to init context\n", __func__);
+                llama_free(ctx);
+                return false;
+            }
+            for (const llama_seq_id s : dropped) {
+                // the reference sees the same removal, which for DeepSeek V4 also zeroes the stream's rows
+                llama_memory_seq_rm(llama_get_memory(ref), s, -1, -1);
+                const std::vector<tokspec> restart = { { s, 0, tok_at(n_vocab, s, 0, 5) } };
+                ok = decode_specs(ctx, restart) == 0 && decode_specs(ref, restart) == 0;
+                const std::string diff = ok ? state_diff(seq_state(ctx, s), seq_state(ref, s)) : "(decode failed)";
+                fprintf(stderr, "%s : %s: seq %d restarted after the drop %s a fresh context %s\n", __func__, c.name, s,
+                        diff.empty() ? "matches" : "DIFFERS from", diff.c_str());
+                all_ok = all_ok && diff.empty();
+            }
+            llama_free(ref);
         }
         llama_free(ctx);
     }

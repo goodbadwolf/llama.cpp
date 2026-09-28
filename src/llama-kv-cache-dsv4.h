@@ -150,10 +150,11 @@ public:
     void set_rs_depth(const std::vector<uint32_t> & depth);
     void grant_rs_depth(const llama_ubatch & ubatch);
 
-    // undo a failed ubatch: restore the rollback indices its plans consumed and remove its positions, or when the
-    // graph may have written the compressor state, remove its sequences
-    void revert_ubatch(const std::vector<llama_ubatch> & ubatches, size_t i_ubatch, bool graph_ran,
-                       const std::vector<uint32_t> & rs_idx_prev);
+    // undo a failed ubatch: give back the rollback indices that the plans of this and the later ubatches consumed,
+    // then remove the failed ubatch's positions, or its sequences when the graph may have written the compressor
+    // state. Returns the sequences removed.
+    std::vector<llama_seq_id> revert_ubatch(const std::vector<llama_ubatch> & ubatches, size_t i_ubatch, bool graph_ran,
+                                            const std::vector<uint32_t> & rs_idx_prev);
 
     llama_kv_cache_iswa * get_raw() const;
     llama_kv_cache      * get_csa() const;
@@ -366,7 +367,7 @@ public:
 
     bool next()  override;
     bool apply() override;
-    void revert(bool graph_ran) override;
+    std::vector<llama_seq_id> revert(bool graph_ran) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

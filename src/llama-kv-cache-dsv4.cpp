@@ -1776,8 +1776,31 @@ void llama_kv_cache_dsv4::grant_rs_depth(const llama_ubatch & ubatch) {
     }
 }
 
-void llama_kv_cache_dsv4::revert_ubatch(const std::vector<llama_ubatch> & ubatches, size_t i_ubatch, bool graph_ran,
-                                        const std::vector<uint32_t> & rs_idx_prev) {
+std::vector<llama_seq_id> llama_kv_cache_dsv4::revert_ubatch(const std::vector<llama_ubatch> & ubatches, size_t i_ubatch, bool graph_ran,
+                                                             const std::vector<uint32_t> & rs_idx_prev) {
+    std::vector<llama_seq_id> dropped;
+
+    // The plans consumed the pending rollback of every sequence in the batch when the context was built. The
+    // ubatches before this one ran their restores; this one and the later ones did not, so their sequences get
+    // their indices back unless an earlier ubatch already restored them.
+    std::vector<bool> restored_earlier(n_seq_max, false);
+    for (size_t j = 0; j < i_ubatch; ++j) {
+        for (uint32_t t = 0; t < ubatches[j].n_seqs_unq; ++t) {
+            const llama_seq_id seq_id = ubatches[j].seq_id_unq[t];
+            if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max) {
+                restored_earlier[seq_id] = true;
+            }
+        }
+    }
+    for (size_t j = i_ubatch; j < ubatches.size(); ++j) {
+        for (uint32_t t = 0; t < ubatches[j].n_seqs_unq; ++t) {
+            const llama_seq_id seq_id = ubatches[j].seq_id_unq[t];
+            if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max && !restored_earlier[seq_id] && (size_t) seq_id < rs_idx_prev.size()) {
+                rs_idx[seq_id] = rs_idx_prev[seq_id];
+            }
+        }
+    }
+
     const llama_ubatch & ubatch = ubatches[i_ubatch];
 
     for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
@@ -1790,11 +1813,11 @@ void llama_kv_cache_dsv4::revert_ubatch(const std::vector<llama_ubatch> & ubatch
             // the compressor state is updated in place, so whatever the graph wrote before failing is unknown
             LLAMA_LOG_WARN("%s: removing seq_id = %d, the failed ubatch may have overwritten its state\n", __func__, seq_id);
             seq_rm(seq_id, -1, -1);
+            dropped.push_back(seq_id);
             continue;
         }
 
-        // nothing was computed: drop the positions the raw cache took and give back the rollback restore that the
-        // first ubatch of this batch touching the sequence consumed when the plans were built
+        // nothing was computed: drop the positions the raw cache took
         llama_pos p0 = std::numeric_limits<llama_pos>::max();
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             if (dsv4_token_has_seq(ubatch, i, seq_id)) {
@@ -1807,17 +1830,9 @@ void llama_kv_cache_dsv4::revert_ubatch(const std::vector<llama_ubatch> & ubatch
             kv_hca->seq_rm(seq_id, p0/DSV4_HCA_RATIO, -1);
             kv_lid->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
         }
-
-        bool consumed_earlier = false;
-        for (size_t j = 0; j < i_ubatch; ++j) {
-            for (uint32_t t = 0; t < ubatches[j].n_seqs_unq; ++t) {
-                consumed_earlier = consumed_earlier || ubatches[j].seq_id_unq[t] == seq_id;
-            }
-        }
-        if (!consumed_earlier && (size_t) seq_id < rs_idx_prev.size()) {
-            rs_idx[seq_id] = rs_idx_prev[seq_id];
-        }
     }
+
+    return dropped;
 }
 
 void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches) {
@@ -2244,16 +2259,16 @@ bool llama_kv_cache_dsv4_context::apply() {
     return res;
 }
 
-void llama_kv_cache_dsv4_context::revert(bool graph_ran) {
+std::vector<llama_seq_id> llama_kv_cache_dsv4_context::revert(bool graph_ran) {
     if (ubatches.empty() || kv == nullptr) {
-        return;
+        return {};
     }
 
     if (!graph_ran) {
         kv->set_rs_depth(rs_depth_prev);
     }
 
-    kv->revert_ubatch(ubatches, i_next, graph_ran, rs_idx_prev);
+    return kv->revert_ubatch(ubatches, i_next, graph_ran, rs_idx_prev);
 }
 
 llama_memory_status llama_kv_cache_dsv4_context::get_status() const {
