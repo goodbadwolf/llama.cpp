@@ -718,8 +718,12 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// the mask is scanned in chunks of FATTN_SPARSE_CHUNK columns, chunk_counts holds n_lists*ceil(mask->ne[0]/FATTN_SPARSE_CHUNK) ints
+#define FATTN_SPARSE_CHUNK 2048
+
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
+        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t * chunk_counts,
+        int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
@@ -972,6 +976,36 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// sparse: dequantize only the KV rows named in the index lists, at their dense positions. Padded slots gather row 0,
+// so the extra last block converts row 0 and the list blocks skip it. Same arithmetic as dequantize_block_q8_0_f16.
+static __global__ void flash_attn_ext_q8_0_f16_rows(
+        const char * __restrict__ src, half * __restrict__ dst, const int32_t * __restrict__ indices, const int64_t n_indices,
+        const int ne0, const int ne2, const int ne3,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3, const int64_t db1, const int64_t db2, const int64_t db3) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+    const int64_t j = blockIdx.x;
+    const int64_t row = j < n_indices ? indices[j] : 0;
+    if (j < n_indices && row <= 0) {
+        return;
+    }
+
+    for (int i3 = 0; i3 < ne3; ++i3) {
+        for (int i2 = 0; i2 < ne2; ++i2) {
+            const block_q8_0 * x = (const block_q8_0 *) (src + row*nb1 + i2*nb2 + i3*nb3);
+            half2 * y2 = (half2 *) ((char *) dst + row*db1 + i2*db2 + i3*db3);
+            for (int k = threadIdx.x; k < ne0/2; k += blockDim.x) {
+                const block_q8_0 * b = x + (2*k)/QK8_0;
+                const char2 qs = ((const char2 *) b->qs)[k % (QK8_0/2)];
+                y2[k] = __hmul2(make_half2(qs.x, qs.y), __half2half2(b->d));
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(src, dst, indices, n_indices, ne0, ne2, ne3, nb1, nb2, nb3, db1, db2, db3);
+    NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1023,13 +1057,52 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
+    const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
+    const int gqa_ratio    = Q->ne[2] / K->ne[2];
+    const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
+    const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
+
+    // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
+    int32_t n_kv_max = 0;
+    size_t  n_lists  = 0;
+    if (use_sparse) {
+        GGML_ASSERT(mask != nullptr);
+        const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
+        GGML_ASSERT(n_kv_max_query > 0);
+        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
+
+        n_lists = size_t(ntiles_x) * mask->ne[3];
+
+        const size_t n_chunks = (mask->ne[0] + FATTN_SPARSE_CHUNK - 1) / FATTN_SPARSE_CHUNK;
+
+        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists + n_chunks*n_lists);
+        int32_t * counts = KV_max.ptr + size_t(n_kv_max)*n_lists;
+        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, counts, counts + n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+    }
+
+    // sparse: the kernel reads only the listed rows and row 0, so only those need an f16 copy
+    const int64_t n_indices = int64_t(n_kv_max)*n_lists;
+    const bool sparse_rows = use_sparse && fp16_available(cc) && n_indices < K->ne[1];
+    auto convert_rows_q8_0 = [&](const char * src, half * dst_f16, const ggml_tensor * t, const size_t db1, const size_t db2, const size_t db3) {
+        const dim3 blocks_num(n_indices + 1, 1, 1);
+        const dim3 block_dim(WARP_SIZE*4, 1, 1);
+        flash_attn_ext_q8_0_f16_rows<<<blocks_num, block_dim, 0, main_stream>>>(
+            src, dst_f16, KV_max.ptr, n_indices, t->ne[0], t->ne[2], t->ne[3], t->nb[1], t->nb[2], t->nb[3], db1, db2, db3);
+        CUDA_CHECK(cudaGetLastError());
+    };
+
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
-        if (ggml_is_contiguously_allocated(K)) {
+        if (sparse_rows && K->type == GGML_TYPE_Q8_0 && ggml_is_contiguously_allocated(K)) {
+            nb11 = nb11*bs*sizeof(half)/ts;
+            nb12 = nb12*bs*sizeof(half)/ts;
+            nb13 = nb13*bs*sizeof(half)/ts;
+            convert_rows_q8_0(K_data, K_f16, K, nb11, nb12, nb13);
+        } else if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
 
@@ -1063,7 +1136,12 @@ void launch_fattn(
 
             GGML_ASSERT(f16_extra.V != 0);
             half * V_f16 = (half *) f16_extra.V;
-            if (ggml_is_contiguously_allocated(V)) {
+            if (sparse_rows && V->type == GGML_TYPE_Q8_0 && ggml_is_contiguously_allocated(V)) {
+                nb21 = nb21*bs*sizeof(half)/ts;
+                nb22 = nb22*bs*sizeof(half)/ts;
+                nb23 = nb23*bs*sizeof(half)/ts;
+                convert_rows_q8_0(V_data, V_f16, V, nb21, nb22, nb23);
+            } else if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
                 V_data = (char *) V_f16;
@@ -1085,25 +1163,6 @@ void launch_fattn(
             }
             V_data = (char *) V_f16;
         }
-    }
-
-    const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
-    const int gqa_ratio    = Q->ne[2] / K->ne[2];
-    const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
-    const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
-
-    // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
-    int32_t n_kv_max = 0;
-    if (use_sparse) {
-        GGML_ASSERT(mask != nullptr);
-        const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
-        GGML_ASSERT(n_kv_max_query > 0);
-        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
-
-        const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
-
-        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
