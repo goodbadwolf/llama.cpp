@@ -27,7 +27,8 @@ public:
         const llama_memory_i::layer_filter_cb & filter);
 
     void clear(llama_seq_id seq_id, bool data);
-    void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
+    // stream_src is plane-major (plane*n_stream + seq), so a pending rollback's plane can be the source
+    void seq_cp(uint32_t stream_src, llama_seq_id seq_id_dst);
     void apply_copies(const stream_copy_info & sc_info) const;
 
     uint32_t get_ratio()      const;
@@ -56,6 +57,7 @@ private:
         ggml_tensor * kv;
         ggml_tensor * score;
 
+        // one view per plane-major stream
         std::vector<ggml_tensor *> kv_stream;
         std::vector<ggml_tensor *> score_stream;
     };
@@ -122,6 +124,8 @@ public:
 
     void clear(bool data) override;
 
+    void set_rollback_enabled(bool enabled) override;
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
@@ -139,6 +143,18 @@ public:
     //
     // llama_kv_cache_dsv4 specific API
     //
+
+    // how many tokens each sequence can roll back with its own snapshot planes: the last ubatch wrote planes
+    // 1..n_seq_tokens as its history (plane n_seq_tokens is the incoming state), valid for consecutive positions
+    const std::vector<uint32_t> & get_rs_depth() const;
+    void set_rs_depth(const std::vector<uint32_t> & depth);
+    void grant_rs_depth(const llama_ubatch & ubatch);
+
+    // undo a failed ubatch: give back the rollback indices that the plans of this and the later ubatches consumed,
+    // then remove the failed ubatch's positions, or its sequences when the graph may have written the compressor
+    // state. Returns the sequences removed.
+    std::vector<llama_seq_id> revert_ubatch(const std::vector<llama_ubatch> & ubatches, size_t i_ubatch, bool graph_ran,
+                                            const std::vector<uint32_t> & rs_idx_prev);
 
     llama_kv_cache_iswa * get_raw() const;
     llama_kv_cache      * get_csa() const;
@@ -162,6 +178,10 @@ private:
     const uint32_t n_rs_seq;
 
     std::vector<uint32_t> rs_idx;
+    std::vector<uint32_t> rs_depth;
+
+    // false while the attention is non-causal, see set_rollback_enabled()
+    bool rollback_enabled = true;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
@@ -347,6 +367,7 @@ public:
 
     bool next()  override;
     bool apply() override;
+    std::vector<llama_seq_id> revert(bool graph_ran) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -374,7 +395,13 @@ public:
 private:
     size_t i_next = 0;
 
+    llama_kv_cache_dsv4 * kv = nullptr;
+
     std::vector<llama_ubatch> ubatches;
+
+    // the rollback indices and depths before this batch, so that a failed ubatch can be undone
+    std::vector<uint32_t> rs_idx_prev;
+    std::vector<uint32_t> rs_depth_prev;
 
     std::vector<comp_plan> plans_csa;
     std::vector<comp_plan> plans_hca;

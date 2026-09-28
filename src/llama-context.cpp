@@ -227,6 +227,14 @@ llama_context::llama_context(
         cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
     }
 
+    // recurrent snapshots written under non-causal attention have seen the tokens after them, so they cannot
+    // serve a rollback. The model's own flag counts too: a non-causal model writes a single plane whatever the
+    // context's attention type says
+    if (cparams.n_rs_seq > 0 && (!cparams.causal_attn || !hparams.causal_attn)) {
+        LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but attention is not causal; clamping to 0\n", __func__, cparams.n_rs_seq);
+        cparams.n_rs_seq = 0;
+    }
+
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
@@ -1256,6 +1264,11 @@ void llama_context::set_causal_attn(bool value) {
 
     cparams.causal_attn = value;
 
+    // recurrent snapshots written under non-causal attention are not valid rollback history
+    if (memory) {
+        memory->set_rollback_enabled(value);
+    }
+
     sched_need_reserve = true;
 }
 
@@ -1393,8 +1406,19 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // a failed ubatch can leave sequences whose state the graph overwrote; they are removed from every memory
+    const auto revert_memory = [&](bool graph_ran) {
+        if (!mctx) {
+            return;
+        }
+        for (const llama_seq_id seq_id : mctx->revert(graph_ran)) {
+            memory->seq_rm(seq_id, -1, -1);
+        }
+    };
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+        revert_memory(false);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
@@ -1432,12 +1456,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+            revert_memory(false);
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            revert_memory(false);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
@@ -1458,6 +1484,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        revert_memory(true);
         ret = status;
         return nullptr;
     }
@@ -1894,9 +1921,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
 
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const auto & seq_id = ubatch.seq_id[i][0];
+                // a token can belong to several sequences, and each of them took the position
+                for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+                    const auto & seq_id = ubatch.seq_id[i][s];
 
-                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+                    pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+                }
             }
 
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -1906,7 +1936,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
                 LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
 
-                memory->seq_rm(s, pos_min[s], -1);
+                if (!memory->seq_rm(s, pos_min[s], -1)) {
+                    // the memory cannot drop only the failed positions, so drop the sequence rather than keep
+                    // entries the graph never computed
+                    LLAMA_LOG_WARN("%s: removing all memory module entries for seq_id = %d\n", __func__, s);
+                    memory->seq_rm(s, -1, -1);
+                }
             }
 
             switch (status) {

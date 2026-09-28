@@ -43,6 +43,8 @@ public:
 
     void clear(bool data) override;
 
+    void set_rollback_enabled(bool enabled) override;
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
@@ -58,6 +60,10 @@ public:
 
     // find a contiguous slot of memory cells and emplace the ubatch there
     bool find_slot(const llama_ubatch & ubatch);
+
+    // undo the last find_slot() done through apply() after its ubatch failed
+    // when graph_ran is true, sequences whose cell data the graph may have overwritten are removed and returned
+    std::vector<llama_seq_id> revert_slot(const llama_ubatch & ubatch, bool graph_ran);
 
     bool get_can_shift() const override;
 
@@ -78,11 +84,18 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // false while the attention is non-causal, see set_rollback_enabled()
+    bool rollback_enabled = true;
+
     // computed before each graph build
     uint32_t n = 0;
 
     // first zero-ed state
     int32_t rs_z = -1;
+
+    // rows of snapshot planes that move with a relocated non-member cell (see build_rs)
+    std::vector<int32_t> carry_src;
+    std::vector<int64_t> carry_dst;
 
     // TODO: optimize for recurrent state needs
     struct mem_cell {
@@ -90,6 +103,10 @@ public:
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;
+
+        // how many tokens the state can be rolled back with the cell's own snapshot planes:
+        //   plane j <= rs_depth is this cell's state j tokens ago, written by the last ubatch
+        uint32_t  rs_depth = 0;
 
         std::set<llama_seq_id> seq_id;
 
@@ -107,6 +124,15 @@ public:
     };
 
     std::vector<mem_cell> cells;
+
+    // metadata before the last find_slot() done through apply(), so that a failed ubatch can be undone
+    struct {
+        bool valid = false;
+        uint32_t head = 0;
+        uint32_t used = 0;
+        std::vector<mem_cell> cells;
+        std::vector<uint32_t> rs_idx;
+    } backup;
 
     // per layer
     std::vector<ggml_tensor *> r_l;
@@ -160,6 +186,7 @@ public:
 
     bool next()  override;
     bool apply() override;
+    std::vector<llama_seq_id> revert(bool graph_ran) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -178,6 +205,11 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // snapshot planes carried for relocated non-member cells, as (source row, destination row) pairs
+    uint32_t get_n_carry() const;
+    int32_t  carry_src(int i) const;
+    int64_t  carry_dst(int i) const;
 
 private:
     const llama_memory_status status;

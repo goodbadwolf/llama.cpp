@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -58,6 +59,12 @@ struct llama_memory_context_i {
     // apply the memory state for the current ubatch to the memory object
     // return false on failure
     virtual bool apply() = 0;
+
+    // undo what apply() did for the current ubatch after the ubatch failed
+    // when graph_ran is true the graph may have written to the memory, so state that could have been
+    // overwritten is removed instead of restored
+    // returns the sequences whose state was lost, so that the caller can remove them from every memory
+    virtual std::vector<llama_seq_id> revert(bool graph_ran) { GGML_UNUSED(graph_ran); return {}; }
 
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;
@@ -124,6 +131,14 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    //
+    // recurrent rollback
+    //
+
+    // snapshots written under non-causal attention are not rollback history: while disabled, partial removals are
+    // refused and no new rollback depth is granted
+    virtual void set_rollback_enabled(bool enabled) { GGML_UNUSED(enabled); }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
