@@ -749,6 +749,9 @@ static bool test_pending_index_lifecycle(const common_params & params, llama_mod
                 ok = ok && llama_memory_seq_rm(mem, seq_pending, P - R, -1);
             }
 
+            // DeepSeek V4 clears a removed stream with a memset that Metal does not order after in-flight compute
+            llama_synchronize(roll);
+
             std::vector<tokspec> next_roll;
             std::vector<tokspec> next_ref;
             llama_seq_id seq_ref = 0;
