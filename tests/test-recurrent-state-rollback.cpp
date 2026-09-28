@@ -889,23 +889,25 @@ static bool test_failed_ubatch(const common_params & params, llama_model * model
         llama_seq_id              pending;      // this seq verifies 4 tokens, accepts 2 and rolls back 2 first (-1: none)
         bool                      shared;       // seq 1 becomes a copy of seq 0, so both own one cell
         bool                      copy_to_2;    // seq 2 becomes a copy of seq 0, so seq 0's cell is shared
-        bool                      coupled;      // the aborted ubatch is one token owned by all abort_seqs
-        std::vector<llama_seq_id> abort_seqs;   // the aborted ubatch: n_tokens[i] tokens for abort_seqs[i]
+        std::vector<llama_seq_id> coupled;      // one token owned by all of these goes first in the aborted ubatch
+        std::vector<llama_seq_id> abort_seqs;   // then n_tokens[i] tokens for abort_seqs[i]
         std::vector<int>          n_tokens;
         int                       countdown;    // abort at this callback check: 0 is before any node
         std::vector<llama_seq_id> check;
     };
     const abort_case cases[] = {
-        { "abort of a 16-token ubatch with n_rs_seq 8",               1, 8, { 0 },       -1, false, false, false, { 0 },    { 16 },   0, { 0 } },
-        { "abort of a 4-token ubatch with n_rs_seq 0",                1, 0, { 0 },       -1, false, false, false, { 0 },    { 4 },    0, { 0 } },
-        { "abort of a 4-token verify ubatch",                         1, 8, { 0 },       -1, false, false, false, { 0 },    { 4 },    0, { 0 } },
-        { "abort of a 4-token verify ubatch mid-graph",               1, 8, { 0 },       -1, false, false, false, { 0 },    { 4 },   40, { 0 } },
-        { "abort of a decode after a pending rollback",               1, 8, { 0 },        0, false, false, false, { 0 },    { 1 },    0, { 0 } },
-        { "abort of a ubatch that relocates a non-member",            3, 8, { 1, 0, 2 }, -1, false, false, false, { 1, 2 }, { 1, 1 }, 0, { 0, 1, 2 } },
-        { "abort of a decode of a seq that shares its cell",          2, 8, { 0 },       -1, true,  false, false, { 1 },    { 1 },    0, { 0, 1 } },
-        { "abort mid-graph of a coupled token landing in a freed cell", 3, 8, { 0, 1 },   -1, false, true,  true,  { 0, 1 }, { 1 },   40, { 0, 1, 2 } },
-        { "abort of the first ubatch while the next one's seq has a pending rollback", 2, 8, { 0, 1 }, 1, false, false, false, { 0, 1 }, { 4, 1 }, 0, { 0, 1 } },
-        { "control: abort with ordered cells, nothing moves",         3, 8, { 0, 1, 2 }, -1, false, false, false, { 1, 2 }, { 1, 1 }, 0, { 0 } },
+        { "abort of a 16-token ubatch with n_rs_seq 8",               1, 8, { 0 },       -1, false, false, {},       { 0 },    { 16 },   0, { 0 } },
+        { "abort of a 4-token ubatch with n_rs_seq 0",                1, 0, { 0 },       -1, false, false, {},       { 0 },    { 4 },    0, { 0 } },
+        { "abort of a 4-token verify ubatch",                         1, 8, { 0 },       -1, false, false, {},       { 0 },    { 4 },    0, { 0 } },
+        { "abort of a 4-token verify ubatch mid-graph",               1, 8, { 0 },       -1, false, false, {},       { 0 },    { 4 },   40, { 0 } },
+        { "abort of a decode after a pending rollback",               1, 8, { 0 },        0, false, false, {},       { 0 },    { 1 },    0, { 0 } },
+        { "abort of a ubatch that relocates a non-member",            3, 8, { 1, 0, 2 }, -1, false, false, {},       { 1, 2 }, { 1, 1 }, 0, { 0, 1, 2 } },
+        { "abort of a decode of a seq that shares its cell",          2, 8, { 0 },       -1, true,  false, {},       { 1 },    { 1 },    0, { 0, 1 } },
+        { "abort mid-graph of a coupled token landing in a freed cell", 3, 8, { 0, 1 },   -1, false, true,  { 0, 1 }, {},       {},      40, { 0, 1, 2 } },
+        // seq 2 leaves its cell for the coupled token, the empty cell stays inside the range and is zeroed
+        { "abort mid-graph of a coupled token that frees a cell in the range", 5, 8, { 0, 3, 2, 4, 1 }, -1, false, false, { 0, 2 }, { 1 }, { 1 }, 40, { 0, 1, 2, 3, 4 } },
+        { "abort of the first ubatch while the next one's seq has a pending rollback", 2, 8, { 0, 1 }, 1, false, false, {}, { 0, 1 }, { 4, 1 }, 0, { 0, 1 } },
+        { "control: abort with ordered cells, nothing moves",         3, 8, { 0, 1, 2 }, -1, false, false, {},       { 1, 2 }, { 1, 1 }, 0, { 0 } },
     };
 
     bool all_ok = true;
@@ -922,7 +924,7 @@ static bool test_failed_ubatch(const common_params & params, llama_model * model
             llama_free(ctx);
             continue;
         }
-        if (c.coupled && model_is_arch(model, "qwen4exp")) {
+        if (!c.coupled.empty() && model_is_arch(model, "qwen4exp")) {
             // its PLE n-gram embeddings assert on tokens shared by several sequences
             fprintf(stderr, "%s : %s: skipped, the model does not take tokens shared by sequences\n", __func__, c.name);
             llama_free(ctx);
@@ -957,22 +959,25 @@ static bool test_failed_ubatch(const common_params & params, llama_model * model
             before.push_back(seq_state(ctx, s));
         }
 
-        int rc;
-        ctl.countdown = c.countdown;
-        if (c.coupled) {
-            llama_batch batch = llama_batch_init(1, 0, (int32_t) c.abort_seqs.size());
-            common_batch_add(batch, tok_at(n_vocab, c.abort_seqs[0], pos[c.abort_seqs[0]] + 1, 1), pos[c.abort_seqs[0]] + 1, c.abort_seqs, true);
-            rc = llama_decode(ctx, batch);
-            llama_batch_free(batch);
-        } else {
-            std::vector<tokspec> aborted;
-            for (size_t i = 0; i < c.abort_seqs.size(); ++i) {
-                const llama_seq_id s = c.abort_seqs[i];
-                aborted = tok_cat(aborted, tok_run(n_vocab, s, pos[s] + 1, c.n_tokens[i], 1));
-            }
-            rc = decode_specs(ctx, aborted);
+        int n_aborted = 0;
+        for (const int n : c.n_tokens) {
+            n_aborted += n;
         }
+        llama_batch batch = llama_batch_init(n_aborted + 1, 0, std::max<int32_t>(1, (int32_t) c.coupled.size()));
+        if (!c.coupled.empty()) {
+            const llama_pos p = pos[c.coupled[0]] + 1;
+            common_batch_add(batch, tok_at(n_vocab, c.coupled[0], p, 1), p, c.coupled, true);
+        }
+        for (size_t i = 0; i < c.abort_seqs.size(); ++i) {
+            const llama_seq_id s = c.abort_seqs[i];
+            for (int k = 0; k < c.n_tokens[i]; ++k) {
+                common_batch_add(batch, tok_at(n_vocab, s, pos[s] + 1 + k, 1), pos[s] + 1 + k, { s }, true);
+            }
+        }
+        ctl.countdown = c.countdown;
+        const int rc = llama_decode(ctx, batch);
         ctl.countdown = -1;
+        llama_batch_free(batch);
         if (!ok) {
             fprintf(stderr, "%s : %s: setup failed\n", __func__, c.name);
             llama_free(ctx);
@@ -984,6 +989,12 @@ static bool test_failed_ubatch(const common_params & params, llama_model * model
             all_ok = all_ok && c.countdown != 0;
             llama_free(ctx);
             continue;
+        }
+        if (rc != 2) {
+            // anything but the abort status means the batch failed before the graph, which is not the case under test
+            fprintf(stderr, "%s : %s: decode failed with %d instead of aborting\n", __func__, c.name, rc);
+            llama_free(ctx);
+            return false;
         }
         std::vector<llama_seq_id> dropped;
         for (size_t i = 0; i < c.check.size(); ++i) {
