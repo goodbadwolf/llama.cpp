@@ -62,8 +62,8 @@ public:
     bool find_slot(const llama_ubatch & ubatch);
 
     // undo the last find_slot() done through apply() after its ubatch failed
-    // when graph_ran is true, sequences whose cell data the graph may have overwritten are removed
-    void revert_slot(const llama_ubatch & ubatch, bool graph_ran);
+    // when graph_ran is true, sequences whose cell data the graph may have overwritten are removed and returned
+    std::vector<llama_seq_id> revert_slot(const llama_ubatch & ubatch, bool graph_ran);
 
     bool get_can_shift() const override;
 
@@ -186,7 +186,7 @@ public:
 
     bool next()  override;
     bool apply() override;
-    void revert(bool graph_ran) override;
+    std::vector<llama_seq_id> revert(bool graph_ran) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

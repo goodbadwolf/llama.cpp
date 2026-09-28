@@ -783,38 +783,21 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     return n >= n_seqs;
 }
 
-void llama_memory_recurrent::revert_slot(const llama_ubatch & ubatch, bool graph_ran) {
+std::vector<llama_seq_id> llama_memory_recurrent::revert_slot(const llama_ubatch & ubatch, bool graph_ran) {
+    std::vector<llama_seq_id> dropped;
+
     if (!backup.valid) {
-        return;
+        return dropped;
     }
     backup.valid = false;
 
-    // Sequences whose cell data the graph may have overwritten. The graph writes the members' cells and copies
-    // plane 0 of every relocated non-member from its old cell, which by then is a member's cell. Whether those
-    // writes ran is unknown, so both are dropped. A member whose state came from a cell the graph left alone
-    // is restored by the metadata alone.
-    std::vector<llama_seq_id> drop;
+    // The cells the graph may have written: the members' cells, and the cells that received plane 0 of a relocated
+    // non-member (its old cell is by then a member's). Whether those writes ran is unknown.
+    std::vector<bool> written(size, false);
     if (graph_ran) {
-        const uint32_t n_seqs = ubatch.n_seqs;
-
-        const auto written = [&](int32_t c) {
-            if (c < (int32_t) head || c >= (int32_t) (head + n)) {
-                return false;
-            }
-            return c < (int32_t) (head + n_seqs) || cells[c].src0 != c;
-        };
-
         for (uint32_t i = 0; i < n; ++i) {
             const int32_t c = head + i;
-            const auto & cell = cells[c];
-
-            const bool member = i < n_seqs;
-            const bool moved  = cell.src0 != c;
-
-            const bool lost = member ? (!moved || written(cell.src0)) : moved;
-            if (lost) {
-                drop.insert(drop.end(), cell.seq_id.begin(), cell.seq_id.end());
-            }
+            written[c] = i < ubatch.n_seqs || (!cells[c].is_empty() && cells[c].src0 != c);
         }
     }
 
@@ -823,10 +806,21 @@ void llama_memory_recurrent::revert_slot(const llama_ubatch & ubatch, bool graph
     used   = backup.used;
     rs_idx = std::move(backup.rs_idx);
 
-    for (const llama_seq_id seq_id : drop) {
+    // With the metadata as it was before the ubatch, a sequence whose cell was written has lost its state. One whose
+    // cell the graph left alone, for instance a member that had copied its shared cell, is intact.
+    for (uint32_t s = 0; s < size; ++s) {
+        const int32_t tail = cells[s].tail;
+        if (tail >= 0 && written[tail]) {
+            dropped.push_back((llama_seq_id) s);
+        }
+    }
+
+    for (const llama_seq_id seq_id : dropped) {
         LLAMA_LOG_WARN("%s: removing seq_id = %d, the failed ubatch may have overwritten its state\n", __func__, seq_id);
         seq_rm(seq_id, -1, -1);
     }
+
+    return dropped;
 }
 
 bool llama_memory_recurrent::get_can_shift() const {
@@ -1429,12 +1423,12 @@ bool llama_memory_recurrent_context::apply() {
     return true;
 }
 
-void llama_memory_recurrent_context::revert(bool graph_ran) {
+std::vector<llama_seq_id> llama_memory_recurrent_context::revert(bool graph_ran) {
     if (ubatches.empty()) {
-        return;
+        return {};
     }
 
-    mem->revert_slot(ubatches[i_next], graph_ran);
+    return mem->revert_slot(ubatches[i_next], graph_ran);
 }
 
 llama_memory_status llama_memory_recurrent_context::get_status() const {

@@ -118,7 +118,7 @@ public:
 
     bool next()  override;
     bool apply() override;
-    void revert(bool graph_ran) override;
+    std::vector<llama_seq_id> revert(bool graph_ran) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
