@@ -158,9 +158,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
-        // a sparse variant at the full tile width gathers the union of its queries once, prefer it for large batches
+        // a sparse variant at the full tile width gathers the union of its queries once, prefer it when the batch fills more
+        // than one tile: below that the per-query lists are built in parallel and gather fewer rows than the padded union
         constexpr bool has_wide_sparse = ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 64/ncols2, ncols2);
-        if (!(has_wide_sparse && Q->ne[1] > 32/ncols2) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, ncols2)) {
+        if (!(has_wide_sparse && Q->ne[1] > 64/ncols2) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, ncols2)) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
             return;
         }
