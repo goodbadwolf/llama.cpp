@@ -228,8 +228,9 @@ llama_context::llama_context(
     }
 
     // recurrent snapshots written under non-causal attention have seen the tokens after them, so they cannot
-    // serve a rollback
-    if (cparams.n_rs_seq > 0 && !cparams.causal_attn) {
+    // serve a rollback. The model's own flag counts too: a non-causal model writes a single plane whatever the
+    // context's attention type says
+    if (cparams.n_rs_seq > 0 && (!cparams.causal_attn || !hparams.causal_attn)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but attention is not causal; clamping to 0\n", __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }

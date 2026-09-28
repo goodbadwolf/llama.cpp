@@ -1417,15 +1417,18 @@ static bool test_non_causal(const common_params & params, llama_model * model, i
     const bool model_causal = llama_model_meta_val_str(model, key.c_str(), val, sizeof(val)) < 0 || strcmp(val, "false") != 0;
 
     bool all_ok = true;
-    for (const bool non_causal_type : { false, true }) {
-        const ctx_spec spec = { 1, 8, 64, non_causal_type ? LLAMA_ATTENTION_TYPE_NON_CAUSAL : LLAMA_ATTENTION_TYPE_UNSPECIFIED };
+    for (const llama_attention_type type : { LLAMA_ATTENTION_TYPE_UNSPECIFIED, LLAMA_ATTENTION_TYPE_NON_CAUSAL, LLAMA_ATTENTION_TYPE_CAUSAL }) {
+        const ctx_spec spec = { 1, 8, 64, type };
         llama_context * ctx = make_ctx_multi(params, model, fill, spec);
         if (ctx == nullptr) {
             fprintf(stderr, "%s : failed to init context\n", __func__);
             return false;
         }
-        const bool expect_rollback = model_causal && !non_causal_type;
-        const char * what = non_causal_type ? "attention_type non-causal" : (model_causal ? "control: causal model" : "non-causal model");
+        // a non-causal model writes a single plane whatever the context asks for
+        const bool expect_rollback = model_causal && type != LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+        const char * what = type == LLAMA_ATTENTION_TYPE_NON_CAUSAL ? "attention_type non-causal"
+                          : type == LLAMA_ATTENTION_TYPE_CAUSAL     ? (model_causal ? "control: attention_type causal" : "non-causal model, attention_type causal")
+                          :                                            (model_causal ? "control: causal model" : "non-causal model");
 
         bool ok = decode_specs(ctx, tok_run(n_vocab, 0, 0, P)) == 0;
         ok = ok && decode_specs(ctx, tok_cat(tok_run(n_vocab, 0, P, 2), tok_run(n_vocab, 0, P + 2, 2, 1))) == 0;
