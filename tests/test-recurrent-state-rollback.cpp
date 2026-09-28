@@ -718,12 +718,13 @@ static bool test_pending_index_lifecycle(const common_params & params, llama_mod
     constexpr llama_pos P = 12;
     constexpr llama_pos R = 2;
 
-    enum op_t { OP_SEQ_KEEP, OP_FINITE_RM, OP_SEQ_CP_ONTO, OP_SEQ_CP_FROM };
+    enum op_t { OP_SEQ_KEEP, OP_FINITE_RM, OP_SEQ_CP_ONTO, OP_SEQ_CP_FROM, OP_SEQ_CP_SELF };
     const std::pair<op_t, const char *> variants[] = {
         { OP_SEQ_KEEP,    "seq_keep"           },
         { OP_FINITE_RM,   "finite seq_rm"      },
         { OP_SEQ_CP_ONTO, "seq_cp onto seq 1"  },
         { OP_SEQ_CP_FROM, "seq_cp from seq 0"  },
+        { OP_SEQ_CP_SELF, "seq_cp onto itself" },
     };
 
     bool all_ok = true;
@@ -749,7 +750,7 @@ static bool test_pending_index_lifecycle(const common_params & params, llama_mod
                       decode_specs(roll, tok_run(n_vocab, 1, 0, P)) == 0;
 
             // the rolled-back sequence keeps its anchor, so the request is one the snapshots can serve
-            const llama_seq_id seq_pending = op == OP_SEQ_CP_FROM ? 0 : 1;
+            const llama_seq_id seq_pending = op == OP_SEQ_CP_FROM || op == OP_SEQ_CP_SELF ? 0 : 1;
             if (pending) {
                 ok = ok && llama_memory_seq_rm(mem, seq_pending, P - R, -1);
             }
@@ -789,16 +790,21 @@ static bool test_pending_index_lifecycle(const common_params & params, llama_mod
                     next_roll = { { 1, P, tok_at(n_vocab, 0, P) } };
                     next_ref  = { { 0, P, tok_at(n_vocab, 0, P) } };
                     break;
-                case OP_SEQ_CP_FROM: {
-                    // seq 1 becomes a copy of seq 0 while seq 0's rollback is pending, and continues from there
-                    ok = ok && llama_memory_seq_rm(mem, 1, -1, -1);
-                    llama_memory_seq_cp(mem, 0, 1, -1, -1);
+                case OP_SEQ_CP_FROM:
+                case OP_SEQ_CP_SELF: {
+                    // seq 1 (or seq 0 itself) becomes a copy of seq 0 while seq 0's rollback is pending, and
+                    // continues from there
+                    const llama_seq_id dst = op == OP_SEQ_CP_SELF ? 0 : 1;
+                    if (dst != 0) {
+                        ok = ok && llama_memory_seq_rm(mem, dst, -1, -1);
+                    }
+                    llama_memory_seq_cp(mem, 0, dst, -1, -1);
                     ok = ok && decode_specs(ref, tok_run(n_vocab, 0, 0, P)) == 0;
                     if (pending) {
                         ok = ok && llama_memory_seq_rm(llama_get_memory(ref), 0, P - R, -1);
                     }
                     const llama_pos p = pending ? P - R : P;
-                    next_roll = { { 1, p, tok_at(n_vocab, 0, p) } };
+                    next_roll = { { dst, p, tok_at(n_vocab, 0, p) } };
                     next_ref  = { { 0, p, tok_at(n_vocab, 0, p) } };
                     break;
                 }
@@ -813,7 +819,8 @@ static bool test_pending_index_lifecycle(const common_params & params, llama_mod
                 return false;
             }
 
-            const std::string diff = state_diff(seq_state(roll, 1), seq_state(ref, seq_ref));
+            const llama_seq_id seq_roll = op == OP_SEQ_CP_SELF ? 0 : 1;
+            const std::string diff = state_diff(seq_state(roll, seq_roll), seq_state(ref, seq_ref));
             llama_free(roll);
             llama_free(ref);
 
