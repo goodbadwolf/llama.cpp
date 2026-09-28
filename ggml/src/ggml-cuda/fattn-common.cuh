@@ -1102,10 +1102,17 @@ void launch_fattn(
 
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
-        if (sparse_rows && K->type == GGML_TYPE_Q8_0 && ggml_is_contiguously_allocated(K)) {
-            nb11 = nb11*bs*sizeof(half)/ts;
-            nb12 = nb12*bs*sizeof(half)/ts;
-            nb13 = nb13*bs*sizeof(half)/ts;
+        if (sparse_rows && K->type == GGML_TYPE_Q8_0) {
+            if (ggml_is_contiguously_allocated(K)) {
+                nb11 = nb11*bs*sizeof(half)/ts;
+                nb12 = nb12*bs*sizeof(half)/ts;
+                nb13 = nb13*bs*sizeof(half)/ts;
+            } else {
+                // a view over several KV streams has gaps between them: pack the copy as the full conversion below does
+                nb11 = K->ne[0] * sizeof(half);
+                nb12 = K->ne[1] * nb11;
+                nb13 = K->ne[2] * nb12;
+            }
             convert_rows_q8_0(K_data, K_f16, K, nb11, nb12, nb13);
         } else if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
@@ -1141,10 +1148,16 @@ void launch_fattn(
 
             GGML_ASSERT(f16_extra.V != 0);
             half * V_f16 = (half *) f16_extra.V;
-            if (sparse_rows && V->type == GGML_TYPE_Q8_0 && ggml_is_contiguously_allocated(V)) {
-                nb21 = nb21*bs*sizeof(half)/ts;
-                nb22 = nb22*bs*sizeof(half)/ts;
-                nb23 = nb23*bs*sizeof(half)/ts;
+            if (sparse_rows && V->type == GGML_TYPE_Q8_0) {
+                if (ggml_is_contiguously_allocated(V)) {
+                    nb21 = nb21*bs*sizeof(half)/ts;
+                    nb22 = nb22*bs*sizeof(half)/ts;
+                    nb23 = nb23*bs*sizeof(half)/ts;
+                } else {
+                    nb21 = V->ne[0] * sizeof(half);
+                    nb22 = V->ne[1] * nb21;
+                    nb23 = V->ne[2] * nb22;
+                }
                 convert_rows_q8_0(V_data, V_f16, V, nb21, nb22, nb23);
             } else if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
