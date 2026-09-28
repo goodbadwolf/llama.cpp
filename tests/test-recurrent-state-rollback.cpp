@@ -956,7 +956,9 @@ static bool test_failed_ubatch(const common_params & params, llama_model * model
         llama_synchronize(ctx);
         std::vector<std::vector<rs_row>> before;
         for (const llama_seq_id s : c.check) {
-            before.push_back(seq_state(ctx, s));
+            // a copy's state is its source's: DeepSeek V4 zeroes the destination stream and copies at the next decode
+            const bool copy = (c.shared && s == 1) || (c.copy_to_2 && s == 2);
+            before.push_back(seq_state(ctx, copy ? 0 : s));
         }
 
         int n_aborted = 0;
