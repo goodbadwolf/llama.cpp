@@ -93,6 +93,20 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // p_x and q_x are the probabilities of the draft token under the target and the draft distribution
 bool common_sampler_spec_accept(double p_x, double q_x, std::mt19937 & rng);
 
+// on rejection, draw from max(p - q, 0), normalized
+// cur_p holds the target distribution (normalized p), q the draft candidates the draft token was drawn from
+llama_token common_sampler_spec_residual(const llama_token_data_array & cur_p, const std::vector<llama_token_data> & q, std::mt19937 & rng);
+
+// one speculative sampling step: returns draft if accepted, else a token drawn from the residual
+// the returned token is distributed as cur_p when draft was drawn from q
+llama_token common_sampler_spec_verify(const llama_token_data_array & cur_p, const std::vector<llama_token_data> & q, llama_token draft, std::mt19937 & rng);
+
+// like common_sampler_sample_and_accept_n, for drafts sampled from known distributions
+// dists[i] is the distribution draft[i] was drawn from; each position uses common_sampler_spec_verify
+// positions under a grammar, backend sampling and chains that do not end with dist use the plain rule
+std::vector<llama_token> common_sampler_sample_and_accept_n_dist(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & dists, std::mt19937 & rng);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
