@@ -258,6 +258,10 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
+    // sampled draft and speculative-sampling verify (LLAMA_SPEC_SAMPLE_TEMP)
+    bool spec_sample_draft = false;
+    std::mt19937 spec_dist_rng;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -1815,6 +1819,17 @@ private:
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
 
+            if (spec) {
+                const auto & sp = task.params.sampling;
+
+                // the verify rule needs the target to draw from its distribution with the dist sampler
+                slot.spec_sample_draft = !use_backend_sampling && sp.temp > 0.0f && sp.top_k != 1 && sp.mirostat == 0 &&
+                    std::find(sp.samplers.begin(), sp.samplers.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) == sp.samplers.end();
+
+                // xor: keep this stream apart from the chain's own dist sampler, which uses the same seed
+                slot.spec_dist_rng.seed(common_sampler_get_seed(slot.smpl.get()) ^ 0x9e3779b9u);
+            }
+
             if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
                 const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
                     ? std::random_device{}()
@@ -3043,6 +3058,7 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .rng      = */ slot.spec_sample_draft ? &slot.spec_dist_rng : nullptr,
                         };
 
                         drafting.push_back(&slot);
@@ -3923,11 +3939,15 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+                const auto & dists = common_speculative_get_draft_params(spec.get(), slot.id).dists;
+                const bool use_dist = synth_probs.empty() && !slot.spec_is_replay && dists.size() == n_draft;
+                auto accepted = !synth_probs.empty()
+                    ? server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay)
+                    : use_dist
+                    ? common_sampler_sample_and_accept_n_dist(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, dists, slot.spec_dist_rng)
+                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
