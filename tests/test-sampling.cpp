@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "llama.h"
+#include "sampling.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -297,6 +298,24 @@ static void test_sampler_queue(const size_t n_vocab, const std::string & sampler
            samplers_sequence.c_str(), n_vocab, top_k, top_p, min_p);
 }
 
+static void test_spec_accept(double p_x, double q_x) {
+    const int n = 200000;
+
+    std::mt19937 rng(42);
+
+    int n_accept = 0;
+    for (int i = 0; i < n; i++) {
+        n_accept += common_sampler_spec_accept(p_x, q_x, rng);
+    }
+
+    const double expected = q_x > 0.0 ? std::min(1.0, p_x / q_x) : 0.0;
+    const double rate     = (double) n_accept / n;
+    const double tol      = 5.0*std::sqrt(expected*(1.0 - expected)/n) + 1e-9;
+
+    printf("spec accept p=%.2f q=%.2f: rate %.4f, expected %.4f\n", p_x, q_x, rate, expected);
+    GGML_ASSERT(std::fabs(rate - expected) <= tol);
+}
+
 static void bench(llama_sampler * cnstr, const char * cnstr_name, const std::vector<llama_token_data> & data, int n_iter) {
     std::vector<llama_token_data> cur(data.size());
     std::copy(data.begin(), data.end(), cur.begin());
@@ -423,6 +442,12 @@ int main(void) {
     test_sampler_queue(10000, "pmk", 100, 0.8f, 0.1f);
     test_sampler_queue(10000, "mkp", 100, 0.8f, 0.1f);
     test_sampler_queue(10000, "mpk", 100, 0.8f, 0.1f);
+
+    test_spec_accept(0.30, 0.60);
+    test_spec_accept(0.60, 0.30);
+    test_spec_accept(0.20, 0.20);
+    test_spec_accept(0.00, 0.50);
+    test_spec_accept(0.50, 0.00);
 
     printf("OK\n");
 

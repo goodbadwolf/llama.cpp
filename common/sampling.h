@@ -4,6 +4,7 @@
 
 #include "common.h"
 
+#include <random>
 #include <string>
 #include <vector>
 
@@ -87,6 +88,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+
+// speculative sampling: accept a draft token drawn from q with probability min(1, p_x / q_x)
+// p_x and q_x are the probabilities of the draft token under the target and the draft distribution
+bool common_sampler_spec_accept(double p_x, double q_x, std::mt19937 & rng);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
