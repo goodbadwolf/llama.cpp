@@ -718,6 +718,14 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
 }
 
+bool common_sampler_spec_accept(double p_x, double q_x, std::mt19937 & rng) {
+    if (q_x <= 0.0) {
+        return false;
+    }
+
+    return std::uniform_real_distribution<double>(0.0, 1.0)(rng) * q_x < p_x;
+}
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }
