@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "common.h"
 
+#include <random>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -69,6 +71,12 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // when set and LLAMA_SPEC_SAMPLE_TEMP > 0, draft-mtp samples the draft with this generator instead of taking the argmax
+    std::mt19937 * rng = nullptr;
+
+    // for a sampled draft: the distribution each drafted token was drawn from (empty otherwise)
+    std::vector<std::vector<llama_token_data>> dists = {};
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
