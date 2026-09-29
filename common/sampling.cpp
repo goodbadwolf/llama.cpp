@@ -714,6 +714,116 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
 }
 
+bool common_sampler_spec_accept(double p_x, double q_x, std::mt19937 & rng) {
+    if (q_x <= 0.0) {
+        return false;
+    }
+
+    return std::uniform_real_distribution<double>(0.0, 1.0)(rng) * q_x < p_x;
+}
+
+llama_token common_sampler_spec_residual(const llama_token_data_array & cur_p, const std::vector<llama_token_data> & q, std::mt19937 & rng) {
+    std::unordered_map<llama_token, double> q_map;
+    for (const auto & c : q) {
+        q_map[c.id] = c.p;
+    }
+
+    const auto residual = [&](const llama_token_data & c) {
+        const auto it = q_map.find(c.id);
+        return std::max(0.0, (double) c.p - (it == q_map.end() ? 0.0 : it->second));
+    };
+
+    double sum = 0.0;
+    for (size_t j = 0; j < cur_p.size; ++j) {
+        sum += residual(cur_p.data[j]);
+    }
+
+    llama_token res = LLAMA_TOKEN_NULL;
+
+    double t = std::uniform_real_distribution<double>(0.0, 1.0)(rng) * sum;
+    for (size_t j = 0; j < cur_p.size; ++j) {
+        const double r = residual(cur_p.data[j]);
+        if (r > 0.0) {
+            res = cur_p.data[j].id;
+            t -= r;
+            if (t < 0.0) {
+                break;
+            }
+        }
+    }
+
+    return res;
+}
+
+llama_token common_sampler_spec_verify(const llama_token_data_array & cur_p, const std::vector<llama_token_data> & q, llama_token draft, std::mt19937 & rng) {
+    double p_x = 0.0;
+    for (size_t j = 0; j < cur_p.size; ++j) {
+        if (cur_p.data[j].id == draft) {
+            p_x = cur_p.data[j].p;
+            break;
+        }
+    }
+
+    double q_x = 0.0;
+    for (const auto & c : q) {
+        if (c.id == draft) {
+            q_x = c.p;
+            break;
+        }
+    }
+
+    if (common_sampler_spec_accept(p_x, q_x, rng)) {
+        return draft;
+    }
+
+    const llama_token res = common_sampler_spec_residual(cur_p, q, rng);
+
+    // no residual mass left (p == q up to rounding): the draft is a sample of p
+    return res == LLAMA_TOKEN_NULL ? draft : res;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_dist(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & dists, std::mt19937 & rng) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(dists.size() == draft.size());
+
+    llama_synchronize(ctx);
+
+    // cur_p is the distribution of the sampled token only when the CPU chain ends with dist
+    const int n_chain = llama_sampler_chain_n(gsmpl->chain);
+    const bool ends_with_dist = n_chain > 0 && strcmp(llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, n_chain - 1)), "dist") == 0;
+
+    if (!ends_with_dist || llama_get_sampled_token_ith(ctx, idxs[0]) != LLAMA_TOKEN_NULL) {
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft);
+    }
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    for (size_t i = 0; i < draft.size(); i++) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i]);
+
+        // grammar rejection sampling does not draw from cur_p
+        const llama_token tok = grammar_should_apply(gsmpl) ? id : common_sampler_spec_verify(gsmpl->cur_p, dists[i], draft[i], rng);
+
+        common_sampler_accept(gsmpl, tok, true);
+
+        result.push_back(tok);
+
+        if (tok != draft[i]) {
+            return result;
+        }
+    }
+
+    const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[draft.size()]);
+
+    common_sampler_accept(gsmpl, id, true);
+
+    result.push_back(id);
+
+    return result;
+}
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }

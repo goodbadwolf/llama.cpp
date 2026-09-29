@@ -1361,6 +1361,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // LLAMA_SPEC_SAMPLE_TEMP=T > 0: sample the draft from its top candidates at temperature T and record the distribution
+    const float sample_temp = getenv("LLAMA_SPEC_SAMPLE_TEMP") ? (float) atof(getenv("LLAMA_SPEC_SAMPLE_TEMP")) : 0.0f;
+
+    // LLAMA_SPEC_DRAFT_TOPK: number of draft candidates (default 10)
+    const int32_t top_k = getenv("LLAMA_SPEC_DRAFT_TOPK") ? atoi(getenv("LLAMA_SPEC_DRAFT_TOPK")) : 10;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1394,7 +1400,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            sparams.top_k    = top_k;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
@@ -1404,7 +1410,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1680,7 +1686,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                llama_token id = cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1690,9 +1696,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                auto & dp = dparams.at(seq_id);
+
+                if (sample_temp > 0.0f && dp.rng) {
+                    // cur_p is sorted by p, so also by logit
+                    std::vector<llama_token_data> q(cur_p->data, cur_p->data + cur_p->size);
+                    double sum = 0.0;
+                    for (auto & c : q) {
+                        c.p = expf((c.logit - q[0].logit) / sample_temp);
+                        sum += c.p;
+                    }
+                    for (auto & c : q) {
+                        c.p = (float) (c.p / sum);
+                    }
+
+                    double t = std::uniform_real_distribution<double>(0.0, 1.0)(*dp.rng);
+                    size_t k = 0;
+                    for (; k + 1 < q.size(); ++k) {
+                        t -= q[k].p;
+                        if (t < 0.0) {
+                            break;
+                        }
+                    }
+
+                    id = q[k].id;
+                    dp.dists.push_back(std::move(q));
+                }
+
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
@@ -1746,6 +1778,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                dp.dists.clear();
             }
         }
     }
@@ -2818,6 +2851,7 @@ void common_speculative_draft(common_speculative * spec) {
             GGML_ASSERT(!dp.drafting || dp.result->empty());
 
             if (dp.drafting) {
+                dp.dists.clear();
                 n_drafting++;
             }
         }
@@ -2853,6 +2887,9 @@ void common_speculative_draft(common_speculative * spec) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
+                        if (dp.dists.size() > result.size()) {
+                            dp.dists.resize(result.size());
+                        }
                     }
                 }
 
