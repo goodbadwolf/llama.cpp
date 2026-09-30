@@ -217,6 +217,8 @@ struct common_chat_tool {
     std::string name;
     std::string description;
     std::string parameters;
+    // loaded on demand by tool search: known to the tool-call parser, left out of the rendered tools block
+    bool deferred = false;
 };
 
 enum common_chat_tool_choice {

@@ -562,14 +562,18 @@ json common_chat_tools_to_json_oaicompat(const std::vector<common_chat_tool> & t
 
     auto result = json::array();
     for (const auto & tool : tools) {
-        result.push_back({
+        json item = {
             { "type",     "function" },
             { "function", {
                 { "name", tool.name },
                 { "description", tool.description },
                 { "parameters", json::parse(tool.parameters) },
             }},
-        });
+        };
+        if (tool.deferred) {
+            item["defer_loading"] = true;
+        }
+        result.push_back(item);
     }
     return result;
 }
@@ -609,6 +613,7 @@ std::vector<common_chat_tool> common_chat_tools_parse_oaicompat(const json & too
                     /* .name = */ function.at("name"),
                     /* .description = */ function.value("description", ""),
                     /* .parameters = */ function.value("parameters", json::object()).dump(),
+                    /* .deferred = */ tool.value("defer_loading", false),
                 });
             }
         }
@@ -932,6 +937,21 @@ std::string common_chat_template_direct_apply_impl(
         // TODO: merge properly instead of overwriting (matching old behavior)
         for (const auto & [k, v] : additional_context->items()) {
             inp[k] = v;
+        }
+    }
+    if (inp.contains("tools") && inp["tools"].is_array()) {
+        // a deferred tool's definition reaches the prompt with the tool search result that loads it,
+        // so the tools block at the top of the prompt stays the same when the tool list grows
+        json visible = json::array();
+        for (const auto & tool : inp["tools"]) {
+            if (!tool.is_object() || !tool.value("defer_loading", false)) {
+                visible.push_back(tool);
+            }
+        }
+        if (visible.empty()) {
+            inp.erase("tools");
+        } else {
+            inp["tools"] = visible;
         }
     }
     if (inputs.add_generation_prompt) {

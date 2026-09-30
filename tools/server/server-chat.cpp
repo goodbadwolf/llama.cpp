@@ -345,6 +345,24 @@ static void normalize_anthropic_billing_header(std::string & system_text) {
     }
 }
 
+// The text a tool search result stands for: the definition of the tool it loaded, in the format the
+// client's ToolSearch description promises (one <function> line inside a <functions> block).
+static std::string anthropic_tool_reference_text(const json & body, const std::string & tool_name) {
+    if (body.contains("tools") && body.at("tools").is_array()) {
+        for (const auto & tool : body.at("tools")) {
+            if (json_value(tool, "name", std::string()) == tool_name) {
+                json definition = {
+                    {"description", json_value(tool, "description", std::string())},
+                    {"name", tool_name},
+                    {"parameters", tool.contains("input_schema") ? tool.at("input_schema") : json::object()},
+                };
+                return "<functions>\n<function>" + definition.dump() + "</function>\n</functions>\n";
+            }
+        }
+    }
+    return "No definition was sent for tool " + tool_name + ".\n";
+}
+
 json server_chat_convert_anthropic_to_oai(const json & body) {
     json oai_body;
 
@@ -493,6 +511,13 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                                         {"image_url", {{"url", json_value(source, "url", std::string())}}}
                                     });
                                 }
+                            } else if (c_type == "tool_reference") {
+                                std::string text = anthropic_tool_reference_text(body, json_value(c, "tool_name", std::string()));
+                                result_text += text;
+                                content_parts.push_back({
+                                    {"type", "text"},
+                                    {"text", text}
+                                });
                             }
                         }
 
@@ -551,14 +576,18 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         if (tools.is_array()) {
             json oai_tools = json::array();
             for (const auto & tool : tools) {
-                oai_tools.push_back({
+                json oai_tool = {
                     {"type", "function"},
                     {"function", {
                         {"name", json_value(tool, "name", std::string())},
                         {"description", json_value(tool, "description", std::string())},
                         {"parameters", tool.contains("input_schema") ? tool.at("input_schema") : json::object()}
                     }}
-                });
+                };
+                if (json_value(tool, "defer_loading", false)) {
+                    oai_tool["defer_loading"] = true;
+                }
+                oai_tools.push_back(oai_tool);
             }
             oai_body["tools"] = oai_tools;
         }
