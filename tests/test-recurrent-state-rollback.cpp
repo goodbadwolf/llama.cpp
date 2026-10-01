@@ -17,20 +17,18 @@
 #include <vector>
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
-    llama_batch batch = llama_batch_init(count, 0, 1);
+    common_batch batch(ctx);
     for (uint32_t pos = 0; pos < count; ++pos) {
-        common_batch_add(batch, tokens[pos], pos, { 0 }, pos + 1 == count);
+        batch.add(tokens[pos], pos, { 0 }, pos + 1 == count);
     }
-    const bool ok = llama_decode(ctx, batch) == 0;
-    llama_batch_free(batch);
+    const bool ok = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
     return ok;
 }
 
 static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
-    llama_batch batch = llama_batch_init(1, 0, 1);
-    common_batch_add(batch, tok, pos, { 0 }, true);
-    const bool ok = llama_decode(ctx, batch) == 0;
-    llama_batch_free(batch);
+    common_batch batch(ctx);
+    batch.add(tok, pos, { 0 }, true);
+    const bool ok = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
     return ok;
 }
 
@@ -162,24 +160,23 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     // decodes the anchor with the tail, which is then rolled back so its restore
     // is pending at replay
     for (uint32_t s = 0; s < n_seqs && ok; ++s) {
-        llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+        common_batch batch(ctx_ref);
         for (llama_pos pos = 0; pos < (llama_pos) p0; ++pos) {
-            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+            batch.add(tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
-        ok = ok && llama_decode(ctx_ref, batch) == 0;
+        ok = ok && llama_process(ctx_ref, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
 
-        common_batch_clear(batch);
+        batch.clear();
         for (llama_pos pos = 0; pos < p_tail; ++pos) {
-            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+            batch.add(tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
-        ok = ok && llama_decode(ctx_roll, batch) == 0;
+        ok = ok && llama_process(ctx_roll, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
 
-        common_batch_clear(batch);
+        batch.clear();
         for (llama_pos pos = p_tail; pos < (llama_pos) n_prompt; ++pos) {
-            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+            batch.add(tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
-        ok = ok && llama_decode(ctx_roll, batch) == 0;
-        llama_batch_free(batch);
+        ok = ok && llama_process(ctx_roll, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
 
         ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0, -1);
 
@@ -192,16 +189,15 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         return false;
     }
 
-    llama_batch batch = llama_batch_init(n_seqs*n_replay, 0, 1);
+    common_batch batch(ctx_roll);
     for (uint32_t s = 0; s < n_seqs; ++s) {
         for (uint32_t i = 0; i < n_replay; ++i) {
             const llama_pos pos = p0 + (llama_pos) i;
-            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, true);
+            batch.add(tok(s, pos), pos, { (llama_seq_id) s }, true);
         }
     }
-    ok = llama_decode(ctx_roll, batch) == 0;
-    ok = ok && llama_decode(ctx_ref, batch) == 0;
-    llama_batch_free(batch);
+    ok = llama_process(ctx_roll, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+    ok = ok && llama_process(ctx_ref, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
     if (!ok) {
         fprintf(stderr, "%s : multi-seq replay decode failed\n", __func__);
         cleanup();
@@ -260,13 +256,12 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     constexpr uint32_t n_tail = 4;
 
     {
-        llama_batch batch_tail = llama_batch_init(n_tail, 0, 1);
+        common_batch batch_tail(ctx_ref);
         for (uint32_t i = 0; i < n_tail; ++i) {
             const llama_pos pos = p0 + (llama_pos) (n_replay + i);
-            common_batch_add(batch_tail, tok(0, pos + 7), pos, { 0 }, false);
+            batch_tail.add(tok(0, pos + 7), pos, { 0 }, false);
         }
-        ok = llama_decode(ctx_ref, batch_tail) == 0;
-        llama_batch_free(batch_tail);
+        ok = llama_process(ctx_ref, LLAMA_PROCESS_TYPE_DECODE, batch_tail.get()) == 0;
     }
 
     float diff_tail = 0.0f;
@@ -274,11 +269,10 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     double nmse_tail_a0 = 0.0;
     for (uint32_t i = 0; i < n_tail && ok; ++i) {
         const llama_pos pos = p0 + (llama_pos) (n_replay + i);
-        llama_batch batch_one = llama_batch_init(1, 0, 1);
-        common_batch_add(batch_one, tok(1, pos), pos, { 1 }, true);
-        ok = llama_decode(ctx_roll, batch_one) == 0;
-        ok = ok && llama_decode(ctx_ref, batch_one) == 0;
-        llama_batch_free(batch_one);
+        common_batch batch_one(ctx_roll);
+        batch_one.add(tok(1, pos), pos, { 1 }, true);
+        ok = llama_process(ctx_roll, LLAMA_PROCESS_TYPE_DECODE, batch_one.get()) == 0;
+        ok = ok && llama_process(ctx_ref, LLAMA_PROCESS_TYPE_DECODE, batch_one.get()) == 0;
         if (!ok) {
             break;
         }
@@ -525,12 +519,11 @@ static std::vector<tokspec> tok_cat(std::vector<tokspec> a, const std::vector<to
 }
 
 static int decode_specs(llama_context * ctx, const std::vector<tokspec> & toks) {
-    llama_batch batch = llama_batch_init((int32_t) toks.size(), 0, 1);
+    common_batch batch(ctx);
     for (const auto & t : toks) {
-        common_batch_add(batch, t.tok, t.pos, { t.seq }, true);
+        batch.add(t.tok, t.pos, { t.seq }, true);
     }
-    const int ret = llama_decode(ctx, batch);
-    llama_batch_free(batch);
+    const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
     return ret;
 }
 
@@ -965,21 +958,20 @@ static bool test_failed_ubatch(const common_params & params, llama_model * model
         for (const int n : c.n_tokens) {
             n_aborted += n;
         }
-        llama_batch batch = llama_batch_init(n_aborted + 1, 0, std::max<int32_t>(1, (int32_t) c.coupled.size()));
+        common_batch batch(ctx);
         if (!c.coupled.empty()) {
             const llama_pos p = pos[c.coupled[0]] + 1;
-            common_batch_add(batch, tok_at(n_vocab, c.coupled[0], p, 1), p, c.coupled, true);
+            batch.add(tok_at(n_vocab, c.coupled[0], p, 1), p, c.coupled, true);
         }
         for (size_t i = 0; i < c.abort_seqs.size(); ++i) {
             const llama_seq_id s = c.abort_seqs[i];
             for (int k = 0; k < c.n_tokens[i]; ++k) {
-                common_batch_add(batch, tok_at(n_vocab, s, pos[s] + 1 + k, 1), pos[s] + 1 + k, { s }, true);
+                batch.add(tok_at(n_vocab, s, pos[s] + 1 + k, 1), pos[s] + 1 + k, { s }, true);
             }
         }
         ctl.countdown = c.countdown;
-        const int rc = llama_decode(ctx, batch);
+        const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         ctl.countdown = -1;
-        llama_batch_free(batch);
         if (!ok) {
             fprintf(stderr, "%s : %s: setup failed\n", __func__, c.name);
             llama_free(ctx);
