@@ -149,6 +149,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-recurrent-state-rollback-fleet.cpp)
 llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
@@ -214,6 +215,17 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --models "${MODEL_DIR}"
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    # The fleet's own rollback cases (relocation, failed ubatch, pending index, split KV streams) on the three models they target
+    foreach (fleet_model IN ITEMS nemotron_h-dense deepseek4-moe kimi-k3-moe)
+        llama_test(
+            test-recurrent-state-rollback-fleet
+            NAME test-recurrent-state-rollback-fleet-${fleet_model}
+            LABEL main
+            ARGS -m "${MODEL_DIR}/${fleet_model}.gguf"
+        )
+        set_tests_properties(test-recurrent-state-rollback-fleet-${fleet_model} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach ()
 
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(
