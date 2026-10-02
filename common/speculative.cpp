@@ -2506,6 +2506,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
         }
+
+        // llama_process splits the draft batch by n_ubatch, so the draft compute buffers need not be sized for the target's ubatch.
+        // n_batch stays the target's: the server hands the draft up to a target n_batch of tokens in one call
+        result.n_ubatch = std::min<int32_t>(result.n_ubatch, 64);
     }
 
     result.cache_type_k  = params_spec.cache_type_k;
