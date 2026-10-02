@@ -124,6 +124,9 @@ private:
     // whether the current layout has cells shared between sequences (kpool_layout is incomplete here, so out of line)
     bool kpool_layout_shared() const;
 
+    // brings lay up to the cache as it is now: an append, a tail edit or a full rebuild, whichever mem_idx_stale allows
+    void kpool_layout_build(kpool_layout & lay) const;
+
     // seq_id < 0 stales every sequence, p0 < 0 stales the sequence from its first position
     void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);
 

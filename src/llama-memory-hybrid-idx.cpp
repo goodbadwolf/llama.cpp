@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <type_traits>
 
 #include "llama-impl.h"
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>
 #include <stdexcept>
 
@@ -417,8 +419,29 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
         kpool_lay = std::make_unique<kpool_layout>();
     }
 
-    auto & lay = *kpool_lay;
+    kpool_layout_build(*kpool_lay);
 
+    // LLAMA_KPOOL_CHECK=1 rebuilds the layout from scratch after every update and aborts when the two differ
+    static const bool check = getenv("LLAMA_KPOOL_CHECK") != nullptr;
+    if (check) {
+        kpool_layout ref;
+        kpool_layout_build(ref);
+        const auto & lay = *kpool_lay;
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            const auto & x = lay.seqs[s];
+            const auto & y = ref.seqs[s];
+            if (x.pos_min != y.pos_min || x.strm != y.strm || x.shared != y.shared || x.cells != y.cells || x.pools != y.pools) {
+                GGML_ABORT("%s: kpool layout of seq %d differs from a full rebuild: cells %zu/%zu pools %zu/%zu pos_min %d/%d shared %d/%d stale %d\n", __func__, s,
+                           x.cells.size(), y.cells.size(), x.pools.size(), y.pools.size(), (int) x.pos_min, (int) y.pos_min, (int) x.shared, (int) y.shared, (int) mem_idx_stale[s]);
+            }
+        }
+        GGML_ASSERT(lay.n_pool_real == ref.n_pool_real && lay.cache_safe == ref.cache_safe);
+    }
+
+    return *kpool_lay;
+}
+
+void llama_memory_hybrid_idx::kpool_layout_build(kpool_layout & lay) const {
     const uint32_t kpool       = get_kpool();
     const uint32_t n_stream_kv = mem_idx->get_n_stream();
     const bool     unified     = n_stream_kv == 1;
@@ -441,17 +464,36 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
         sq.strm = unified ? 0 : mem_idx->get_stream(s);
 
         size_t n_kept = 0;
+        bool   tail   = false;
         if (mem_idx_stale[s] == POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
                 sq.pos_min == sp.begin()->first) {
             n_kept = sq.cells.size();
             for (auto it = sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
                 sq.cells.push_back(*it);
             }
+        } else if (mem_idx_stale[s] != POS_CLEAN && mem_idx_stale[s] > 0 && !sq.shared && !sq.cells.empty() && !sp.empty() &&
+                sq.pos_min == sp.begin()->first) {
+            // an edit at p0 above the first position leaves everything before p0 as it was: keep those cells and the pools
+            // that end inside them, and take the cells from p0 on from the sequence again. A rejected draft is such an edit
+            const llama_pos p0 = mem_idx_stale[s];
+            const size_t k = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(p0, 0u)) - sq.cells.begin();
+            size_t n_keep_pools = 0;
+            if (k >= kpool) {
+                n_keep_pools = std::upper_bound(sq.pools.begin(), sq.pools.end(), (uint32_t) (k - kpool)) - sq.pools.begin();
+            }
+            sq.cells.resize(k);
+            sq.pools.resize(n_keep_pools);
+            sq.j_next = n_keep_pools > 0 ? (size_t) sq.pools.back() + kpool : 0;
+            for (auto it = sp.lower_bound(std::make_pair(p0, 0u)); it != sp.end(); ++it) {
+                sq.cells.push_back(*it);
+            }
+            n_kept = k;
+            tail   = true;
         }
 
         // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
         // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
-        if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
+        if (sq.cells.size() != sp.size() || (mem_idx_stale[s] != POS_CLEAN && !tail)) {
             sq.cells.assign(sp.begin(), sp.end());
             sq.pools.clear();
             sq.j_next  = 0;
@@ -506,8 +548,6 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
         lay.n_pool_real += (uint32_t) sq.pools.size();
         lay.cache_safe   = lay.cache_safe && !sq.shared;
     }
-
-    return lay;
 }
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_status status) :
