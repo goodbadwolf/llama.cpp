@@ -310,6 +310,12 @@ public:
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
+    // snapshot planes to carry for relocated states, sized for the most a ubatch can relocate so every graph
+    // has the shape the reserve covered. Absent only when nothing can ever be relocated
+    ggml_tensor * s_carry_src      = nullptr; // I32 [n_carry_max]
+    ggml_tensor * s_carry_dst      = nullptr; // I64 [n_carry_max]
+    ggml_tensor * s_carry_dst_used = nullptr; // view of s_carry_dst over this ubatch's n_carry rows
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
@@ -1423,6 +1429,8 @@ struct llm_graph_context {
             ggml_tensor * s,
             ggml_tensor * state_copy,
             ggml_tensor * state_copy_main,
+            ggml_tensor * state_carry_src,
+            ggml_tensor * state_carry_dst,
                 int32_t   state_size,
                 int32_t   n_seqs,
                uint32_t   n_rs,

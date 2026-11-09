@@ -157,6 +157,15 @@ public:
     const std::vector<uint32_t> & get_rs_idx() const;
     void update_rs_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
+    const std::vector<uint32_t> & get_rs_max() const;
+
+    // undo the failed ubatch i_ubatch of a batch whose context took rs_idx_prev and rs_max_prev before it consumed
+    // the rollbacks and granted the bounds of every ubatch: the ubatches before i_ubatch keep what they did, the
+    // failed one gives back its positions, or its sequences when the graph may have written their state
+    std::vector<llama_seq_id> revert_ubatch(const std::vector<llama_ubatch> & ubatches, size_t i_ubatch, bool graph_ran,
+                                            const std::vector<uint32_t> & rs_idx_prev,
+                                            const std::vector<uint32_t> & rs_max_prev);
+
     // copy the sources into their mirrors after a state read
     void refill_comp_mirrors();
 
@@ -369,6 +378,8 @@ public:
     bool next()  override;
     bool apply() override;
 
+    std::vector<llama_seq_id> revert(bool graph_ran) override;
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
@@ -428,4 +439,8 @@ private:
     const llama_memory_status status;
 
     llama_kv_cache_dsv4 * kv = nullptr;
+
+    // the rollback indices and bounds before this batch, so that a failed ubatch can be undone
+    std::vector<uint32_t> rs_idx_prev;
+    std::vector<uint32_t> rs_max_prev;
 };

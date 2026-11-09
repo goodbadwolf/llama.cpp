@@ -613,8 +613,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             // copy old tail into the empty cell
             if (seq_meta.tail >= 0) {
                 auto & orig_cell = cells[seq_meta.tail];
-                empty_cell.pos = orig_cell.pos;
-                empty_cell.src = orig_cell.src;
+                empty_cell.pos    = orig_cell.pos;
+                empty_cell.src    = orig_cell.src;
+                empty_cell.rs_max = orig_cell.rs_max; // the copy is the same state, so it keeps the same bound
                 orig_cell.seq_id.erase(seq_id);
                 empty_cell.seq_id.insert(seq_id); // will be overwritten
                 GGML_ASSERT(!orig_cell.is_empty()); // has at least one remaining seq_id
@@ -643,8 +644,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             auto & dst_cell = cells[dst_id];
             auto & src_cell = cells[src_id];
 
-            std::swap(dst_cell.pos, src_cell.pos);
-            std::swap(dst_cell.src, src_cell.src);
+            std::swap(dst_cell.pos,    src_cell.pos);
+            std::swap(dst_cell.src,    src_cell.src);
+            std::swap(dst_cell.rs_max, src_cell.rs_max); // the bound describes the state, so it travels with it
             std::swap(dst_cell.seq_id, src_cell.seq_id);
 
             // swap tails
@@ -720,8 +722,109 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     used = std::count_if(cells.begin(), cells.end(),
         [](const mem_cell & cell){ return !cell.is_empty(); });
 
+    // The graph copies only plane 0 of a non-member cell whose data was moved by the gather above. Its snapshot
+    // planes have to move with it, or a later rollback of that sequence reads the previous occupant's history.
+    carry_src.clear();
+    carry_dst.clear();
+    for (uint32_t i = n_seqs; i < n; ++i) {
+        const int32_t c = head + i;
+        auto & cell = cells[c];
+        if (cell.is_empty()) {
+            continue;
+        }
+
+        // s_copy runs over every entry of the block, not only the members, so it consumes a pending rollback
+        // here too: the gather reads plane k and the copy above writes that state into plane 0 of this cell.
+        // The ubatch writes no snapshot of its own at a non-member cell, so the planes it kept are no longer at
+        // the distances this cell's pos implies. Carry nothing and claim no bound.
+        bool pending = false;
+        for (const llama_seq_id seq_id : cell.seq_id) {
+            pending = pending || rs_idx[seq_id] != 0;
+        }
+        if (pending) {
+            cell.rs_max = 0;
+            continue;
+        }
+
+        if (cell.src0 == c) {
+            continue;
+        }
+        for (uint32_t j = 1; j <= n_rs_seq; ++j) {
+            carry_src.push_back((int32_t) (j*size) + cell.src0);
+            carry_dst.push_back((int64_t) (j*size) + c);
+        }
+    }
+
     // sanity check
     return n >= n_seqs;
+}
+
+void llama_memory_recurrent::backup_slot() {
+    backup.valid  = true;
+    backup.head   = head;
+    backup.used   = used;
+    backup.n      = n;
+    backup.rs_z   = rs_z;
+    backup.cells  = cells;
+    backup.rs_idx = rs_idx;
+}
+
+std::vector<llama_seq_id> llama_memory_recurrent::revert_slot(const llama_ubatch & ubatch, bool graph_ran) {
+    std::vector<llama_seq_id> dropped;
+
+    if (!backup.valid) {
+        return dropped;
+    }
+    backup.valid = false;
+
+    // The cells the graph may have written, all of them inside [head, head + n): the members' cells with every
+    // plane, the empty cells of the range (the zeroed state and the extra-state copy), and the cells that received
+    // a relocated state, plane 0 by the extra-state copy and the snapshot planes by the carry. A non-member that
+    // kept its cell only copies its own row onto itself, and a pending rollback re-reads a plane nothing wrote.
+    // Whether those writes ran is unknown.
+    // a memory without layers (an MTP draft context) holds no state the graph could write
+    std::vector<bool> written(size, false);
+    if (graph_ran && !is_empty()) {
+        for (uint32_t i = 0; i < n; ++i) {
+            const int32_t c = head + i;
+            written[c] = i < ubatch.n_seqs || cells[c].is_empty() || cells[c].src0 != c;
+        }
+    }
+
+    cells  = std::move(backup.cells);
+    head   = backup.head;
+    used   = backup.used;
+    n      = backup.n;
+    rs_z   = backup.rs_z;
+    rs_idx = std::move(backup.rs_idx);
+
+    // With the metadata as it was before the ubatch, a sequence whose cell was written has lost its state. One whose
+    // cell the graph left alone, for instance a member that had copied its shared cell, is intact.
+    for (uint32_t s = 0; s < size; ++s) {
+        const int32_t tail = cells[s].tail;
+        if (tail >= 0 && written[tail]) {
+            dropped.push_back((llama_seq_id) s);
+        }
+    }
+
+    for (const llama_seq_id seq_id : dropped) {
+        LLAMA_LOG_WARN("%s: removing seq_id = %d, the failed ubatch may have overwritten its state\n",
+                __func__, seq_id);
+        seq_rm(seq_id, -1, -1);
+    }
+
+    // a sequence of the failed ubatch keeps its state but no rollback: an SWA attention cache beside this memory
+    // evicted rows for the ubatch before it failed, and a rollback could need them
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][k];
+            if (seq_id >= 0 && (uint32_t) seq_id < size && cells[seq_id].tail >= 0) {
+                cells[cells[seq_id].tail].rs_max = 0;
+            }
+        }
+    }
+
+    return dropped;
 }
 
 bool llama_memory_recurrent::get_can_shift() const {
@@ -1299,6 +1402,9 @@ llama_memory_recurrent_context::~llama_memory_recurrent_context() = default;
 bool llama_memory_recurrent_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
+    // the ubatch succeeded, so there is nothing left to undo
+    mem->backup.valid = false;
+
     if (++i_next >= ubatches.size()) {
         return false;
     }
@@ -1317,9 +1423,18 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
+    mem->backup_slot();
     mem->find_slot(ubatches[i_next]);
 
     return true;
+}
+
+std::vector<llama_seq_id> llama_memory_recurrent_context::revert(bool graph_ran) {
+    if (ubatches.empty()) {
+        return {};
+    }
+
+    return mem->revert_slot(ubatches[i_next], graph_ran);
 }
 
 llama_memory_status llama_memory_recurrent_context::get_status() const {
@@ -1358,6 +1473,23 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
+}
+
+uint32_t llama_memory_recurrent_context::get_n_carry() const {
+    return is_full ? get_n_carry_max() : (uint32_t) mem->carry_src.size();
+}
+
+// every cell but the first member relocated, each with all of its snapshot planes
+uint32_t llama_memory_recurrent_context::get_n_carry_max() const {
+    return mem->size > 0 ? (mem->size - 1)*mem->n_rs_seq : 0;
+}
+
+int32_t llama_memory_recurrent_context::carry_src(int i) const {
+    return mem->carry_src[i];
+}
+
+int64_t llama_memory_recurrent_context::carry_dst(int i) const {
+    return mem->carry_dst[i];
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

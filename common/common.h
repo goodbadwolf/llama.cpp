@@ -1070,8 +1070,8 @@ struct common_memory {
 
     void init(llama_context * ctx_tgt, llama_context * ctx_dft = nullptr);
 
-    // aborts execution on failure
-    void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    // returns false when a memory module refused the removal, and calls ctx_dft even when ctx_tgt refuses
+    bool seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
 };

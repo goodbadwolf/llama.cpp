@@ -133,6 +133,10 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// Testing only: fail the n-th ubatch from now after its memory is applied and before its graph is built
+// (0 = the next one), with the status a graph allocation failure returns. -1 disables it.
+LLAMA_API void llama_test_fail_before_graph(struct llama_context * ctx, int32_t n);
+
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0
