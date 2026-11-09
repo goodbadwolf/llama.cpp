@@ -512,6 +512,7 @@ struct case_state_restore_failure : ctx_test {
 //       test passes vacuously
 struct case_state_rotation : ctx_test {
     const char * name() const override { return "rot"; }
+    size_t min_models() const override { return 142; }
 
     const char * description() const override {
         return "a state saved with attention rotation restores only into a matching context";
@@ -609,6 +610,7 @@ struct case_state_rotation : ctx_test {
 // ref: https://github.com/ggml-org/llama.cpp/issues/17527
 struct case_state_restore_fragmented : ctx_test {
     const char * name() const override { return "frag"; }
+    size_t min_models() const override { return 142; }
 
     const char * description() const override {
         return "restore a sequence into a cache fragmented by the removal of another sequence";
@@ -763,6 +765,7 @@ struct case_noalloc : ctx_test {
 
 struct case_comp_padding : ctx_test {
     const char * name() const override { return "comp_padding"; }
+    size_t min_models() const override { return 2; }
 
     const char * description() const override {
         return "fixed-sized DeepSeek batches reuse the compressed-cache graph";

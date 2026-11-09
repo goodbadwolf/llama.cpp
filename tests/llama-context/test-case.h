@@ -57,6 +57,10 @@ struct ctx_test {
     // reading cells it never wrote cannot pass
     virtual bool uses_fill() const { return group() == TEST_GROUP_RS; }
 
+    // the number of models this case has to pass on in a full run, at least one: a case that passes
+    //   on zero models and fails on zero models is a defect, not a pass
+    virtual size_t min_models() const { return 1; }
+
     // non-empty means the case does not apply to this model, the text is the reported reason
     virtual std::string skip_reason(model_run & mr) const;
 
@@ -81,3 +85,20 @@ std::vector<ctx_test_ptr> make_rs_cases();  // cases-rs.cpp
 
 // all cases, in table order
 const std::vector<ctx_test_ptr> & test_cases();
+
+//
+// the floor a case has to clear over a whole run
+//
+
+// what one case did across every model of a run
+struct case_totals {
+    size_t n_pass = 0;
+    size_t n_skip = 0;
+    size_t n_fail = 0;
+};
+
+// one line per case that passed on fewer models than it requires, in table order - a clamp that
+//   disables the feature a case covers skips it everywhere, and that is a defect the suite has to
+//   report rather than a green run
+std::vector<std::string> check_case_minimums(const std::vector<const ctx_test *> & cases,
+                                             const std::vector<case_totals> & totals);

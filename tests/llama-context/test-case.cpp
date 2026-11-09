@@ -1,6 +1,7 @@
 #include "test-case.h"
 
 #include <iterator>
+#include <string>
 
 const char * test_status_str(test_status status) {
     switch (status) {
@@ -51,6 +52,23 @@ std::string ctx_test::skip_reason(model_run & mr) const {
     }
 
     return {};
+}
+
+std::vector<std::string> check_case_minimums(const std::vector<const ctx_test *> & cases,
+                                             const std::vector<case_totals> & totals) {
+    std::vector<std::string> below;
+
+    for (size_t i = 0; i < cases.size() && i < totals.size(); i++) {
+        const size_t min_models = cases[i]->min_models();
+        if (totals[i].n_pass >= min_models) {
+            continue;
+        }
+
+        below.push_back(std::string(cases[i]->name()) + ": passed on " + std::to_string(totals[i].n_pass) +
+                " models, skipped on " + std::to_string(totals[i].n_skip) + ", needs " + std::to_string(min_models));
+    }
+
+    return below;
 }
 
 const std::vector<ctx_test_ptr> & test_cases() {

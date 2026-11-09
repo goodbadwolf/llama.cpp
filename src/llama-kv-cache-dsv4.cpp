@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <climits>
+#include <limits>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -1866,6 +1867,64 @@ void llama_kv_cache_dsv4::update_rs_for_ubatches(const std::vector<llama_ubatch>
     }
 }
 
+const std::vector<uint32_t> & llama_kv_cache_dsv4::get_rs_max() const {
+    return rs_max;
+}
+
+std::vector<llama_seq_id> llama_kv_cache_dsv4::revert_ubatch(
+        const std::vector<llama_ubatch> & ubatches, size_t i_ubatch, bool graph_ran,
+        const std::vector<uint32_t> & rs_idx_prev, const std::vector<uint32_t> & rs_max_prev) {
+    std::vector<llama_seq_id> dropped;
+
+    GGML_ASSERT(i_ubatch < ubatches.size());
+    GGML_ASSERT(rs_idx_prev.size() == rs_idx.size() && rs_max_prev.size() == rs_max.size());
+
+    // the context consumed the rollbacks and granted the bounds of all its ubatches when it was built, but only
+    // the ubatches before the failed one ran
+    rs_idx = rs_idx_prev;
+    rs_max = rs_max_prev;
+    update_rs_for_ubatches(std::vector<llama_ubatch>(ubatches.begin(), ubatches.begin() + i_ubatch));
+
+    const llama_ubatch & ubatch = ubatches[i_ubatch];
+
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+            continue;
+        }
+
+        if (graph_ran) {
+            // the compressor state is updated in place, so whatever the graph wrote before failing is unknown
+            LLAMA_LOG_WARN("%s: removing seq_id = %d, the failed ubatch may have overwritten its state\n",
+                    __func__, seq_id);
+            seq_rm(seq_id, -1, -1);
+            dropped.push_back(seq_id);
+            continue;
+        }
+
+        // nothing was computed: drop the positions the raw cache took, directly, since seq_rm would read them as
+        // a rollback of the sequence
+        llama_pos p0 = std::numeric_limits<llama_pos>::max();
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (dsv4_token_has_seq(ubatch, i, seq_id)) {
+                p0 = std::min(p0, ubatch.pos[i]);
+            }
+        }
+        if (p0 != std::numeric_limits<llama_pos>::max()) {
+            kv_raw->seq_rm(seq_id, p0, -1);
+            kv_csa->seq_rm(seq_id, p0/csa_state->get_ratio(), -1);
+            kv_hca->seq_rm(seq_id, p0/hca_state->get_ratio(), -1);
+            kv_lid->seq_rm(seq_id, p0/lid_state->get_ratio(), -1);
+        }
+
+        // the raw SWA cache evicted rows for the ubatch in apply, which this cannot give back, and a rollback of
+        // the restored state could need them
+        rs_max[seq_id] = 0;
+    }
+
+    return dropped;
+}
+
 void llama_kv_cache_dsv4::refill_comp_mirrors() {
     if (!comp_mirrors_stale) {
         return;
@@ -2250,6 +2309,9 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     lid_state(kv->get_lid_state()),
     status(ctx_raw->get_status()),
     kv(kv) {
+    rs_idx_prev = kv->get_rs_idx();
+    rs_max_prev = kv->get_rs_max();
+
     kv->update_rs_for_ubatches(this->ubatches);
 }
 
@@ -2292,6 +2354,14 @@ bool llama_kv_cache_dsv4_context::apply() {
     kv->refill_comp_mirrors();
 
     return res;
+}
+
+std::vector<llama_seq_id> llama_kv_cache_dsv4_context::revert(bool graph_ran) {
+    if (ubatches.empty() || kv == nullptr) {
+        return {};
+    }
+
+    return kv->revert_ubatch(ubatches, i_next, graph_ran, rs_idx_prev, rs_max_prev);
 }
 
 llama_memory_status llama_kv_cache_dsv4_context::get_status() const {

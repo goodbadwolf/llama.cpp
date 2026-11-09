@@ -60,6 +60,13 @@ public:
     // find a contiguous slot of memory cells and emplace the ubatch there
     bool find_slot(const llama_ubatch & ubatch);
 
+    // copy the metadata that find_slot() changes, so that a failed ubatch can be undone
+    void backup_slot();
+
+    // undo the last find_slot() done through apply() after its ubatch failed
+    // when graph_ran is true, the sequences whose cell data the graph may have overwritten are removed and returned
+    std::vector<llama_seq_id> revert_slot(const llama_ubatch & ubatch, bool graph_ran);
+
     bool get_can_shift() const override;
 
     // state write/load
@@ -84,6 +91,10 @@ public:
 
     // first zero-ed state
     int32_t rs_z = -1;
+
+    // rows of snapshot planes that move with a relocated non-member cell (see build_rs)
+    std::vector<int32_t> carry_src;
+    std::vector<int64_t> carry_dst;
 
     // TODO: optimize for recurrent state needs
     struct mem_cell {
@@ -112,6 +123,18 @@ public:
     };
 
     std::vector<mem_cell> cells;
+
+    // the metadata before the last find_slot() done through apply(), see backup_slot()
+    struct {
+        bool     valid = false;
+        uint32_t head  = 0;
+        uint32_t used  = 0;
+        uint32_t n     = 0;
+        int32_t  rs_z  = -1;
+
+        std::vector<mem_cell> cells;
+        std::vector<uint32_t> rs_idx;
+    } backup;
 
     // per layer
     std::vector<ggml_tensor *> r_l;
@@ -169,6 +192,8 @@ public:
     bool next()  override;
     bool apply() override;
 
+    std::vector<llama_seq_id> revert(bool graph_ran) override;
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
@@ -186,6 +211,12 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // snapshot planes carried for relocated non-member cells, as (source row, destination row) pairs
+    uint32_t get_n_carry() const;
+    uint32_t get_n_carry_max() const;
+    int32_t  carry_src(int i) const;
+    int64_t  carry_dst(int i) const;
 
 private:
     const llama_memory_status status;
