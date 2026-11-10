@@ -550,5 +550,19 @@ int main(int argc, char ** argv) {
     }
     LOG_INF("%s: models: %zu passed, %zu failed (of %zu)\n", __func__, models.size() - n_model_fail, n_model_fail, models.size());
 
-    return n_model_fail == 0 ? 0 : 1;
+    // a case that ran on no model, or on fewer than it requires, proves nothing: a clamp that
+    //   disables the feature it covers would otherwise leave the suite green
+    std::vector<case_totals> totals(cases.size());
+    for (size_t i = 0; i < cases.size(); i++) {
+        totals[i].n_pass = n_pass[i];
+        totals[i].n_skip = n_skip[i];
+        totals[i].n_fail = n_fail[i];
+    }
+
+    const auto below_min = check_case_minimums(cases, totals);
+    for (const auto & line : below_min) {
+        LOG_INF("%s: %s\n", __func__, line.c_str());
+    }
+
+    return n_model_fail == 0 && below_min.empty() ? 0 : 1;
 }

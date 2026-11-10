@@ -127,6 +127,9 @@ struct llama_context {
     // whether decode accepts entries whose embd is a row of ctx_other's layer input device buffer
     bool supports_embd_row() const;
     void set_nextn_layer_offset(int32_t offset);
+
+    // testing only, see llama_test_fail_before_graph: the process_ubatch call to fail, -1 = never
+    int32_t test_fail_before_graph = -1;
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 

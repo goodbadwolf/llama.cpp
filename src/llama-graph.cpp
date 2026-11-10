@@ -481,6 +481,34 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// the row indices of the snapshot planes carried for relocated states, refreshed on every ubatch
+static void set_input_rs_carry(llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx) {
+    if (!inp->s_carry_src) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(inp->s_carry_src->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(inp->s_carry_dst->buffer));
+    GGML_ASSERT(inp->s_carry_src->ne[0] == mctx->get_n_carry_max());
+    GGML_ASSERT(inp->s_carry_dst_used->ne[0] == mctx->get_n_carry());
+
+    int32_t * src = (int32_t *) inp->s_carry_src->data;
+    int64_t * dst = (int64_t *) inp->s_carry_dst->data;
+
+    // rows past n_carry are only gathered, never written back, so any valid row serves
+    for (uint32_t i = 0; i < mctx->get_n_carry_max(); ++i) {
+        const bool used = i < mctx->get_n_carry();
+        src[i] = used ? mctx->carry_src(i) : 0;
+        dst[i] = used ? mctx->carry_dst(i) : 0;
+    }
+}
+
+static bool can_reuse_rs_carry(const llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx) {
+    const int64_t n_carry = inp->s_carry_dst_used ? inp->s_carry_dst_used->ne[0] : 0;
+
+    return n_carry == (int64_t) mctx->get_n_carry();
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
@@ -495,6 +523,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+
+    set_input_rs_carry(this, mctx);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -510,6 +540,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+
+    res &= can_reuse_rs_carry(this, mctx);
 
     return res;
 }
@@ -1209,6 +1241,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    set_input_rs_carry(inp_rs.get(), mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1229,6 +1263,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    res &= can_reuse_rs_carry(inp_rs.get(), mctx->get_recr());
 
     return res;
 }
@@ -1255,6 +1291,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    set_input_rs_carry(inp_rs.get(), mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1274,6 +1312,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    res &= can_reuse_rs_carry(inp_rs.get(), mctx->get_recr());
 
     return res;
 }
@@ -1312,6 +1352,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    set_input_rs_carry(inp_rs.get(), mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1345,6 +1387,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    res &= can_reuse_rs_carry(inp_rs.get(), mctx->get_recr());
 
     return res;
 }
@@ -3945,6 +3989,8 @@ ggml_tensor * llm_graph_context::build_rs(
         ggml_tensor * s,
         ggml_tensor * state_copy,
         ggml_tensor * state_copy_main,
+        ggml_tensor * state_carry_src,
+        ggml_tensor * state_carry_dst,
             int32_t   state_size,
             int32_t   n_seqs,
            uint32_t   n_rs,
@@ -3981,6 +4027,16 @@ ggml_tensor * llm_graph_context::build_rs(
             states_extra,
             ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
 
+    // the copy above moves plane 0 of a relocated extra state; its rollback snapshots move with it
+    // NOTE: this reads the source rows before the model writes the snapshots of the members that now own them
+    // the gather has the fixed length of state_carry_src and the write covers only the n_carry rows of state_carry_dst,
+    // so the padding is never written and the graph keeps one shape whatever this ubatch relocates
+    if (state_carry_src != nullptr) {
+        ggml_tensor * states_carry = ggml_get_rows(ctx0, states, state_carry_src);
+        states_carry = ggml_view_2d(ctx0, states_carry, state_size, state_carry_dst->ne[0], states_carry->nb[1], 0);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, states, states_carry, state_carry_dst));
+    }
+
     return output_states;
 }
 
@@ -4000,6 +4056,19 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - 1, inp->s_copy->nb[0]);
+
+    const int64_t n_carry_max = mctx_cur->get_n_carry_max();
+    if (n_carry_max > 0) {
+        inp->s_carry_src = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_carry_max);
+        ggml_set_input(inp->s_carry_src);
+        ggml_set_name(inp->s_carry_src, "rs_carry_src");
+
+        inp->s_carry_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_carry_max);
+        ggml_set_input(inp->s_carry_dst);
+        ggml_set_name(inp->s_carry_dst, "rs_carry_dst");
+
+        inp->s_carry_dst_used = ggml_view_1d(ctx0, inp->s_carry_dst, mctx_cur->get_n_carry(), 0);
+    }
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
@@ -4027,7 +4096,7 @@ ggml_tensor * llm_graph_context::build_rs(
     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
     ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
 
-    return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
+    return build_rs(s, state_copy, inp->s_copy_main, inp->s_carry_src, inp->s_carry_dst_used, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
 }

@@ -1675,9 +1675,33 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // a failed ubatch can leave sequences whose state the graph overwrote, they are removed from every memory
+    const auto revert_memory = [&](bool graph_ran) {
+        if (!mctx) {
+            return;
+        }
+        if (graph_ran) {
+            // a removal can clear tensor data, so no split of the failed graph may still be running
+            ggml_backend_sched_synchronize(sched.get());
+        }
+        for (const llama_seq_id seq_id : mctx->revert(graph_ran)) {
+            memory->seq_rm(seq_id, -1, -1);
+        }
+    };
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+        revert_memory(false);
         ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    // testing only, see llama_test_fail_before_graph: the failure a graph allocation produces, with the memory
+    // already applied
+    if (test_fail_before_graph >= 0 && test_fail_before_graph-- == 0) {
+        LLAMA_LOG_ERROR("%s: test failure before the graph\n", __func__);
+        revert_memory(false);
+        ret = GGML_STATUS_ALLOC_FAILED;
         return nullptr;
     }
 
@@ -1714,12 +1738,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+            revert_memory(false);
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            revert_memory(false);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
@@ -1740,6 +1766,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        revert_memory(true);
         ret = status;
         return nullptr;
     }
@@ -2152,6 +2179,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
+        // building the batch context can consume rollbacks (DSV4), give them back
+        mctx->revert(false);
         return -2;
     };
 
@@ -2212,9 +2241,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
 
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const auto & seq_id = ubatch.seq_id[i][0];
+                // a token can belong to several sequences, and each of them took the position
+                for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+                    const auto & seq_id = ubatch.seq_id[i][k];
 
-                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+                    pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+                }
             }
 
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -2224,7 +2256,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
                 LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
 
-                memory->seq_rm(s, pos_min[s], -1);
+                if (!memory->seq_rm(s, pos_min[s], -1)) {
+                    // the memory cannot drop only the failed positions, so drop the sequence rather than keep
+                    // entries the graph never computed
+                    LLAMA_LOG_WARN("%s: removing all memory module entries for seq_id = %d\n", __func__, s);
+                    memory->seq_rm(s, -1, -1);
+                }
             }
 
             switch (status) {
@@ -4542,6 +4579,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_test_fail_before_graph(llama_context * ctx, int32_t n) {
+    ctx->test_fail_before_graph = n;
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

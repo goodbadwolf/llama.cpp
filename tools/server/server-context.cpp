@@ -381,7 +381,8 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        mem.seq_rm(id, -1, -1);
+        // a full removal takes the rm_all path, which cannot be refused
+        (void) mem.seq_rm(id, -1, -1);
 
         prompt.clear();
     }
@@ -846,7 +847,8 @@ struct server_slot {
 
     // the other slot continues from the tokens processed so far
     void copy_prompt_to(server_slot & other) const {
-        mem.seq_rm(other.id,     -1, -1);
+        // a full removal takes the rm_all path, which cannot be refused
+        (void) mem.seq_rm(other.id,     -1, -1);
         mem.seq_cp(id, other.id, -1, -1);
 
         other.prompt = prompt.clone();
@@ -855,7 +857,8 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        mem.seq_rm(other.id,     -1, -1);
+        // a full removal takes the rm_all path, which cannot be refused
+        (void) mem.seq_rm(other.id,     -1, -1);
         mem.seq_cp(id, other.id, -1, -1);
 
         other.i_batch = i_batch;
@@ -3815,7 +3818,14 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
+                if (!slot.mem.seq_rm(slot.id, n_keep, n_keep + n_discard)) {
+                    // the memory is ahead of the prompt, which only a failed decode leaves behind, so the shift
+                    // would move positions that were never removed: fail the request and drop the stale claim
+                    send_error(slot, "failed to shift the context", ERROR_TYPE_SERVER);
+                    slot.release();
+                    slot.prompt_clear();
+                    return;
+                }
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
                 // add generated tokens to cache
@@ -4173,7 +4183,11 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            slot.mem.seq_rm (slot.id, head_p, head_c);
+                                            // the range ends inside the prompt, so p1 <= the cell's pos and the
+                                            // bounded rollback path is never entered
+                                            if (!slot.mem.seq_rm(slot.id, head_p, head_c)) {
+                                                GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                                            }
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
 
                                             for (size_t i = 0; i < n_match; i++) {
@@ -4370,7 +4384,16 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    if (!slot.mem.seq_rm(slot.id, p0, -1)) {
+                        // the memory cannot serve the prefix the slot was about to reuse, so drop it to a full
+                        // re-prefill: seq_rm(id, 0, -1) is the rm_all path, which cannot be refused, and clearing
+                        // the prompt makes the add loop below start from the first token
+                        SLT_WRN(slot, "%s", "the memory refused the prefix trim, re-prefilling from position 0\n");
+
+                        (void) slot.mem.seq_rm(slot.id, 0, -1);
+
+                        slot.prompt_clear();
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
@@ -4454,6 +4477,7 @@ private:
                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
                             send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
                             slot.release();
+                            reconcile_slots_with_memory();
                             return; // the slot is done, skip it entirely
                         }
 
@@ -4671,6 +4695,23 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
+    // a failed ubatch can make the memory drop sequences, also of slots that are not processing: such a slot still
+    // claims a prompt the memory no longer holds, and its next prefix reuse would abort on pos_min == -1
+    // a processing slot is left alone, its prompt already holds the tokens of the batch being decoded, and the
+    // failure path either clears it or retries the batch
+    void reconcile_slots_with_memory() {
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
+                continue;
+            }
+            if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) < 0) {
+                SLT_WRN(slot, "the memory dropped this slot's sequence, clearing its %d cached tokens\n",
+                        slot.prompt.n_tokens());
+                slot.prompt_clear();
+            }
+        }
+    }
+
     bool decode(int32_t & n_batch, int32_t off) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
@@ -4713,6 +4754,8 @@ private:
         });
 
         if (ret != 0) {
+            reconcile_slots_with_memory();
+
             {
                 std::string err;
 
@@ -4731,7 +4774,10 @@ private:
                     err = "Compute error.";
                 }
 
-                // TODO: handle ret == 2 (abort) when we start aborting
+                if (ret == 2) {
+                    // the memory already dropped what the aborted ubatch touched, so the batch cannot be retried
+                    err = "Compute aborted.";
+                }
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
@@ -5000,7 +5046,10 @@ private:
                             GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                         }
 
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        // the load above put the cell back at pos_max, so this range is empty and cannot be refused
+                        if (!slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1)) {
+                            GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                        }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
@@ -5047,7 +5096,11 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            // the rollback here is the rejected-draft count against the bound the slot's own verify ubatch wrote,
+            // so it is refused only when the draft is longer than n_rs_seq
+            if (!slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1)) {
+                GGML_ABORT("failed to trim the rejected drafts of sequence %d\n", slot.id);
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
