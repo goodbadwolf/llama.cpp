@@ -1049,6 +1049,36 @@ def test_anthropic_thinking_history_in_template():
     assert prompt.count("<think>") >= 2, f"Expected at least 2 <think> blocks in prompt: {prompt}"
 
 
+def test_anthropic_output_config_effort_in_template(tmp_path):
+    """Test that output_config.effort reaches the chat template as reasoning_effort."""
+    global server
+    template = tmp_path / "effort.jinja"
+    template.write_text(
+        "{%- for m in messages %}{{ m['content'] }}\n{% endfor -%}"
+        "{%- set effort = reasoning_effort | default('medium') -%}"
+        "{%- if effort == 'low' %}low{% elif effort == 'high' %}high high high high high high high high high high{% else %}medium medium medium{% endif -%}"
+    )
+    server.jinja = True
+    server.chat_template_file = str(template)
+    server.start()
+
+    def count_tokens(**extra) -> int:
+        res = server.make_request("POST", "/v1/messages/count_tokens", data={
+            "model": "test",
+            "messages": [{"role": "user", "content": "Say hello"}],
+            **extra,
+        })
+        assert res.status_code == 200, f"Expected 200: {res.body}"
+        return res.body["input_tokens"]
+
+    low = count_tokens(output_config={"effort": "low"})
+    high = count_tokens(output_config={"effort": "high"})
+    default = count_tokens()
+    assert low < default < high, f"Expected low < default < high, got {low}, {default}, {high}"
+    assert count_tokens(output_config={"effort": "medium"}) == default
+    assert count_tokens(output_config={"format": {"type": "json_schema"}}) == default
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize("stream", [False, True])
 def test_anthropic_thinking_with_reasoning_model(stream):
