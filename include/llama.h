@@ -1166,6 +1166,10 @@ extern "C" {
     // chain multiple trained NextN heads. Default 0 (first head).
     LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+    // Testing only: fail the n-th ubatch from now after its memory is applied and before its graph is built
+    // (0 = the next one), with the status a graph allocation failure returns. -1 disables it.
+    LLAMA_API void llama_test_fail_before_graph(struct llama_context * ctx, int32_t n);
+
     // Get all nextn embeddings, mirroring llama_get_embeddings()
     LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
