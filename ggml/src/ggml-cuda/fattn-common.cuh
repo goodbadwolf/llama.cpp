@@ -1048,7 +1048,11 @@ static __global__ void flash_attn_ext_q8_0_f16_rows(
             for (int k = threadIdx.x; k < ne0/2; k += blockDim.x) {
                 const block_q8_0 * b = x + (2*k)/QK8_0;
                 const char2 qs = ((const char2 *) b->qs)[k % (QK8_0/2)];
-                y2[k] = __hmul2(make_half2(qs.x, qs.y), __half2half2(b->d));
+                // nearby queries select overlapping rows, so several blocks store the same value here.
+                // an exchange keeps that defined, where a plain concurrent store is a data race.
+                union { half2 h; unsigned int u; } cv;
+                cv.h = __hmul2(make_half2(qs.x, qs.y), __half2half2(b->d));
+                atomicExch((unsigned int *) &y2[k], cv.u);
             }
         }
     }
@@ -1124,6 +1128,9 @@ void launch_fattn(
     size_t  n_lists  = 0;
     if (use_sparse) {
         GGML_ASSERT(mask != nullptr);
+        // the row converter writes at listed rows, so a mask wider than K would write past the f16 scratch.
+        // shall_use_sparse enforces this, and the launcher must not rely on the dispatcher having checked it.
+        GGML_ASSERT(mask->ne[0] == K->ne[1]);
         const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
         GGML_ASSERT(n_kv_max_query > 0);
         n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
